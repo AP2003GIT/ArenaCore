@@ -1,8 +1,13 @@
 use std::{error::Error, sync::Arc};
 
 use arena_core::{
-    app::build_app, config::Config, service::player_service::PlayerService,
-    storage::memory::InMemoryPlayerRepository,
+    app::build_app,
+    config::Config,
+    service::{lobby_service::LobbyService, player_service::PlayerService},
+    storage::{
+        lobby_memory::InMemoryLobbyRepository, memory::InMemoryPlayerRepository, LobbyRepository,
+        PlayerRepository,
+    },
 };
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -13,9 +18,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = Config::from_env()?;
     let address = config.socket_address();
-    let repository = Arc::new(InMemoryPlayerRepository::new());
-    let player_service = PlayerService::new(repository);
-    let app = build_app(player_service);
+    let player_repository: Arc<dyn PlayerRepository> = Arc::new(InMemoryPlayerRepository::new());
+    let lobby_repository: Arc<dyn LobbyRepository> = Arc::new(InMemoryLobbyRepository::new());
+    let player_service = PlayerService::new(Arc::clone(&player_repository));
+    let lobby_service = LobbyService::new(player_repository, lobby_repository);
+    let app = build_app(player_service, lobby_service);
     let listener = TcpListener::bind(address).await?;
 
     tracing::info!(%address, "ArenaCore server listening");
