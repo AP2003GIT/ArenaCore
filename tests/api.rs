@@ -2,10 +2,16 @@ use std::{collections::HashSet, sync::Arc};
 
 use arena_core::{
     app::build_app,
-    service::{lobby_service::LobbyService, player_service::PlayerService},
+    domain::matchmaking::MatchmakingConfig,
+    service::{
+        lobby_service::LobbyService,
+        matchmaking_service::{MatchmakingService, SystemClock},
+        player_service::PlayerService,
+    },
     storage::{
-        lobby_memory::InMemoryLobbyRepository, memory::InMemoryPlayerRepository, LobbyRepository,
-        PlayerRepository,
+        activity::PlayerActivityRegistry, lobby_memory::InMemoryLobbyRepository,
+        matchmaking_memory::InMemoryMatchmakingRepository, memory::InMemoryPlayerRepository,
+        LobbyRepository, MatchmakingRepository, PlayerRepository,
     },
 };
 use axum::{
@@ -20,11 +26,21 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn test_app() -> Router {
+    let activity_registry = Arc::new(PlayerActivityRegistry::new());
     let player_repository: Arc<dyn PlayerRepository> = Arc::new(InMemoryPlayerRepository::new());
-    let lobby_repository: Arc<dyn LobbyRepository> = Arc::new(InMemoryLobbyRepository::new());
+    let lobby_repository: Arc<dyn LobbyRepository> =
+        Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry)));
+    let matchmaking_repository: Arc<dyn MatchmakingRepository> =
+        Arc::new(InMemoryMatchmakingRepository::new(activity_registry));
     let player_service = PlayerService::new(Arc::clone(&player_repository));
-    let lobby_service = LobbyService::new(player_repository, lobby_repository);
-    build_app(player_service, lobby_service)
+    let lobby_service = LobbyService::new(Arc::clone(&player_repository), lobby_repository);
+    let matchmaking_service = MatchmakingService::new(
+        player_repository,
+        matchmaking_repository,
+        Arc::new(SystemClock),
+        MatchmakingConfig::default(),
+    );
+    build_app(player_service, lobby_service, matchmaking_service)
 }
 
 fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {
@@ -42,12 +58,20 @@ async fn response_json(response: axum::response::Response) -> Value {
 }
 
 async fn create_test_player(app: &Router, display_name: &str) -> Uuid {
+    create_test_player_with_rating(app, display_name, None).await
+}
+
+async fn create_test_player_with_rating(
+    app: &Router,
+    display_name: &str,
+    rating: Option<i32>,
+) -> Uuid {
     let response = app
         .clone()
         .oneshot(json_request(
             "POST",
             "/api/v1/players",
-            json!({ "display_name": display_name }),
+            json!({ "display_name": display_name, "rating": rating }),
         ))
         .await
         .unwrap();
@@ -507,5 +531,259 @@ async fn concurrent_joins_never_exceed_lobby_capacity() {
             .unwrap()
             .len(),
         4
+    );
+}
+
+#[tokio::test]
+async fn one_vs_one_queue_forms_a_readable_match() {
+    let app = test_app();
+    let first_player = create_test_player_with_rating(&app, "First Duelist", Some(1200)).await;
+    let second_player = create_test_player_with_rating(&app, "Second Duelist", Some(1250)).await;
+
+    let first_enqueue = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": first_player, "mode": "1v1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_enqueue.status(), StatusCode::OK);
+    assert_eq!(response_json(first_enqueue).await["status"], "queued");
+
+    let second_enqueue = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": second_player, "mode": "1v1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_enqueue.status(), StatusCode::OK);
+    let matched = response_json(second_enqueue).await;
+    assert_eq!(matched["status"], "matched");
+    assert_eq!(matched["mode"], "1v1");
+    let match_id = matched["match_id"].as_str().unwrap();
+
+    let first_status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/matchmaking/status/{first_player}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_status = response_json(first_status).await;
+    assert_eq!(first_status["status"], "matched");
+    assert_eq!(first_status["match_id"], match_id);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/matches/{match_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let game_match = response_json(response).await;
+    assert_eq!(game_match["mode"], "1v1");
+    assert_eq!(game_match["status"], "ready");
+    assert_eq!(game_match["team_a"]["players"].as_array().unwrap().len(), 1);
+    assert_eq!(game_match["team_b"]["players"].as_array().unwrap().len(), 1);
+
+    let matched_player_lobby = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/lobbies",
+            json!({ "owner_player_id": first_player }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(matched_player_lobby.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(matched_player_lobby).await["error"]["code"],
+        "player_in_match"
+    );
+
+    let matched_player_requeue = app
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": first_player, "mode": "1v1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(matched_player_requeue.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(matched_player_requeue).await["error"]["code"],
+        "player_in_match"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_queue_is_rejected_and_cancellation_is_idempotent() {
+    let app = test_app();
+    let player_id = create_test_player(&app, "Queue Canceller").await;
+
+    let enqueue = || {
+        json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": player_id, "mode": "1v1" }),
+        )
+    };
+
+    let first = app.clone().oneshot(enqueue()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let duplicate = app.clone().oneshot(enqueue()).await.unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(duplicate).await["error"]["code"],
+        "player_already_queued"
+    );
+
+    for _ in 0..2 {
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/matchmaking/queue/{player_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+    }
+
+    let status = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/matchmaking/status/{player_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response_json(status).await["status"], "idle");
+}
+
+#[tokio::test]
+async fn lobby_and_queue_membership_are_mutually_exclusive() {
+    let app = test_app();
+    let queued_player = create_test_player(&app, "Queued Player").await;
+    let lobby_player = create_test_player(&app, "Lobby Player").await;
+
+    let queued = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": queued_player, "mode": "1v1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), StatusCode::OK);
+
+    let queued_player_lobby = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/lobbies",
+            json!({ "owner_player_id": queued_player }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(queued_player_lobby.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(queued_player_lobby).await["error"]["code"],
+        "player_already_queued"
+    );
+
+    create_test_lobby(&app, lobby_player, None).await;
+    let lobby_player_queue = app
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": lobby_player, "mode": "1v1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(lobby_player_queue.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(lobby_player_queue).await["error"]["code"],
+        "player_in_lobby"
+    );
+}
+
+#[tokio::test]
+async fn two_vs_two_match_uses_deterministic_rating_balance() {
+    let app = test_app();
+    let ratings = [1000, 1040, 1060, 1100];
+    let mut final_status = Value::Null;
+
+    for (index, rating) in ratings.into_iter().enumerate() {
+        let player_id =
+            create_test_player_with_rating(&app, &format!("Team Player {index}"), Some(rating))
+                .await;
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/matchmaking/enqueue",
+                json!({ "player_id": player_id, "mode": "2v2" }),
+            ))
+            .await
+            .unwrap();
+        final_status = response_json(response).await;
+    }
+
+    assert_eq!(final_status["status"], "matched");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/matches/{}",
+                    final_status["match_id"].as_str().unwrap()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let game_match = response_json(response).await;
+
+    assert_eq!(game_match["mode"], "2v2");
+    assert_eq!(game_match["team_a"]["total_rating"], 2100);
+    assert_eq!(game_match["team_b"]["total_rating"], 2100);
+}
+
+#[tokio::test]
+async fn invalid_matchmaking_mode_is_a_validation_error() {
+    let app = test_app();
+    let player_id = create_test_player(&app, "Invalid Mode Player").await;
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": player_id, "mode": "3v3" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "invalid_match_mode"
     );
 }

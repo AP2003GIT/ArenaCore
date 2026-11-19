@@ -1,4 +1,6 @@
+pub mod activity;
 pub mod lobby_memory;
+pub mod matchmaking_memory;
 pub mod memory;
 
 use async_trait::async_trait;
@@ -6,7 +8,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{
+    game_match::GameMatch,
     lobby::{Lobby, LobbyError},
+    matchmaking::{MatchmakingConfig, MatchmakingStateError, PlayerMatchmakingStatus, QueueEntry},
     player::Player,
 };
 
@@ -30,6 +34,30 @@ pub trait LobbyRepository: Send + Sync {
     ) -> Result<Lobby, LobbyRepositoryError>;
 }
 
+#[async_trait]
+pub trait MatchmakingRepository: Send + Sync {
+    async fn enqueue(
+        &self,
+        entry: QueueEntry,
+        now_seconds: u64,
+        config: MatchmakingConfig,
+    ) -> Result<PlayerMatchmakingStatus, MatchmakingRepositoryError>;
+    async fn cancel(&self, player_id: Uuid) -> Result<bool, MatchmakingRepositoryError>;
+    async fn status(
+        &self,
+        player_id: Uuid,
+    ) -> Result<PlayerMatchmakingStatus, MatchmakingRepositoryError>;
+    async fn find_match(
+        &self,
+        match_id: Uuid,
+    ) -> Result<Option<GameMatch>, MatchmakingRepositoryError>;
+    async fn run_pending(
+        &self,
+        now_seconds: u64,
+        config: MatchmakingConfig,
+    ) -> Result<Vec<GameMatch>, MatchmakingRepositoryError>;
+}
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("player already exists")]
@@ -46,8 +74,28 @@ pub enum LobbyRepositoryError {
     LobbyNotFound,
     #[error("player is already a member of another lobby")]
     PlayerAlreadyInLobby,
+    #[error("player is queued for matchmaking")]
+    PlayerQueued,
+    #[error("player is already in a match")]
+    PlayerInMatch,
     #[error("lobby repository lock is unavailable")]
     Unavailable,
     #[error(transparent)]
     Lobby(#[from] LobbyError),
+}
+
+#[derive(Debug, Error)]
+pub enum MatchmakingRepositoryError {
+    #[error("player is currently in a lobby")]
+    PlayerInLobby,
+    #[error("player is already queued")]
+    PlayerAlreadyQueued,
+    #[error("player is already in a match")]
+    PlayerInMatch,
+    #[error("matchmaking state lock is unavailable")]
+    Unavailable,
+    #[error("player activity and queue state are inconsistent")]
+    InconsistentState,
+    #[error(transparent)]
+    State(#[from] MatchmakingStateError),
 }

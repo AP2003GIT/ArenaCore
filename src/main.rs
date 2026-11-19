@@ -1,15 +1,24 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, sync::Arc, time::Duration};
 
 use arena_core::{
     app::build_app,
     config::Config,
-    service::{lobby_service::LobbyService, player_service::PlayerService},
+    service::{
+        lobby_service::LobbyService,
+        matchmaking_service::{MatchmakingService, SystemClock},
+        player_service::PlayerService,
+    },
     storage::{
-        lobby_memory::InMemoryLobbyRepository, memory::InMemoryPlayerRepository, LobbyRepository,
-        PlayerRepository,
+        activity::PlayerActivityRegistry, lobby_memory::InMemoryLobbyRepository,
+        matchmaking_memory::InMemoryMatchmakingRepository, memory::InMemoryPlayerRepository,
+        LobbyRepository, MatchmakingRepository, PlayerRepository,
     },
 };
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    task::JoinHandle,
+    time::{self, MissedTickBehavior},
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -18,20 +27,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = Config::from_env()?;
     let address = config.socket_address();
+    let activity_registry = Arc::new(PlayerActivityRegistry::new());
     let player_repository: Arc<dyn PlayerRepository> = Arc::new(InMemoryPlayerRepository::new());
-    let lobby_repository: Arc<dyn LobbyRepository> = Arc::new(InMemoryLobbyRepository::new());
+    let lobby_repository: Arc<dyn LobbyRepository> =
+        Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry)));
+    let matchmaking_repository: Arc<dyn MatchmakingRepository> =
+        Arc::new(InMemoryMatchmakingRepository::new(activity_registry));
     let player_service = PlayerService::new(Arc::clone(&player_repository));
-    let lobby_service = LobbyService::new(player_repository, lobby_repository);
-    let app = build_app(player_service, lobby_service);
+    let lobby_service = LobbyService::new(Arc::clone(&player_repository), lobby_repository);
+    let matchmaking_service = MatchmakingService::new(
+        player_repository,
+        matchmaking_repository,
+        Arc::new(SystemClock),
+        config.matchmaking_config(),
+    );
+    let app = build_app(player_service, lobby_service, matchmaking_service.clone());
     let listener = TcpListener::bind(address).await?;
+    let matchmaker_task = spawn_matchmaker(matchmaking_service);
 
     tracing::info!(%address, "ArenaCore server listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    matchmaker_task.abort();
 
     Ok(())
+}
+
+fn spawn_matchmaker(service: MatchmakingService) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            match service.run_pending().await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, "background matchmaking formed matches"),
+                Err(error) => tracing::error!(%error, "background matchmaking failed"),
+            }
+        }
+    })
 }
 
 fn init_tracing() {

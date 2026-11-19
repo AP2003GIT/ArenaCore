@@ -111,6 +111,8 @@ fn map_repository_error(error: LobbyRepositoryError) -> LobbyServiceError {
     match error {
         LobbyRepositoryError::LobbyNotFound => LobbyServiceError::LobbyNotFound,
         LobbyRepositoryError::PlayerAlreadyInLobby => LobbyServiceError::PlayerAlreadyInLobby,
+        LobbyRepositoryError::PlayerQueued => LobbyServiceError::PlayerQueued,
+        LobbyRepositoryError::PlayerInMatch => LobbyServiceError::PlayerInMatch,
         LobbyRepositoryError::Lobby(LobbyError::Full) => LobbyServiceError::LobbyFull,
         LobbyRepositoryError::Lobby(LobbyError::Closed) => LobbyServiceError::LobbyClosed,
         LobbyRepositoryError::Lobby(LobbyError::MemberNotFound) => {
@@ -130,6 +132,10 @@ pub enum LobbyServiceError {
     LobbyNotFound,
     #[error("player is already in a lobby")]
     PlayerAlreadyInLobby,
+    #[error("player is queued for matchmaking")]
+    PlayerQueued,
+    #[error("player is already in a match")]
+    PlayerInMatch,
     #[error("lobby is full")]
     LobbyFull,
     #[error("lobby is closed")]

@@ -1,23 +1,32 @@
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 
 use crate::{
-    api::{error::ApiError, health::health, lobbies, players},
-    service::{lobby_service::LobbyService, player_service::PlayerService},
+    api::{error::ApiError, health::health, lobbies, matchmaking, players},
+    service::{
+        lobby_service::LobbyService, matchmaking_service::MatchmakingService,
+        player_service::PlayerService,
+    },
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub player_service: PlayerService,
     pub lobby_service: LobbyService,
+    pub matchmaking_service: MatchmakingService,
 }
 
-pub fn build_app(player_service: PlayerService, lobby_service: LobbyService) -> Router {
+pub fn build_app(
+    player_service: PlayerService,
+    lobby_service: LobbyService,
+    matchmaking_service: MatchmakingService,
+) -> Router {
     let state = AppState {
         player_service,
         lobby_service,
+        matchmaking_service,
     };
 
     Router::new()
@@ -32,6 +41,16 @@ pub fn build_app(player_service: PlayerService, lobby_service: LobbyService) -> 
             post(lobbies::leave_lobby),
         )
         .route("/api/v1/lobbies/{lobby_id}/ready", post(lobbies::set_ready))
+        .route("/api/v1/matchmaking/enqueue", post(matchmaking::enqueue))
+        .route(
+            "/api/v1/matchmaking/queue/{player_id}",
+            delete(matchmaking::cancel),
+        )
+        .route(
+            "/api/v1/matchmaking/status/{player_id}",
+            get(matchmaking::get_status),
+        )
+        .route("/api/v1/matches/{match_id}", get(matchmaking::get_match))
         .fallback(ApiError::route_not_found)
         .with_state(state)
 }

@@ -1,16 +1,22 @@
-use std::{collections::HashMap, sync::RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::{
     domain::lobby::Lobby,
-    storage::{LobbyRepository, LobbyRepositoryError},
+    storage::{
+        activity::{PlayerActivity, PlayerActivityRegistry},
+        LobbyRepository, LobbyRepositoryError,
+    },
 };
 
-#[derive(Default)]
 pub struct InMemoryLobbyRepository {
     state: RwLock<LobbyStore>,
+    activity_registry: Arc<PlayerActivityRegistry>,
 }
 
 #[derive(Default)]
@@ -20,14 +26,22 @@ struct LobbyStore {
 }
 
 impl InMemoryLobbyRepository {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(activity_registry: Arc<PlayerActivityRegistry>) -> Self {
+        Self {
+            state: RwLock::new(LobbyStore::default()),
+            activity_registry,
+        }
     }
 }
 
 #[async_trait]
 impl LobbyRepository for InMemoryLobbyRepository {
     async fn create(&self, lobby: Lobby) -> Result<Lobby, LobbyRepositoryError> {
+        let mut activities = self
+            .activity_registry
+            .activities
+            .write()
+            .map_err(|_| LobbyRepositoryError::Unavailable)?;
         let mut store = self
             .state
             .write()
@@ -41,10 +55,16 @@ impl LobbyRepository for InMemoryLobbyRepository {
             return Err(LobbyRepositoryError::AlreadyExists);
         }
 
-        if store.player_lobbies.contains_key(&owner_player_id) {
-            return Err(LobbyRepositoryError::PlayerAlreadyInLobby);
+        match activities.get(&owner_player_id) {
+            Some(PlayerActivity::Lobby(_)) => {
+                return Err(LobbyRepositoryError::PlayerAlreadyInLobby);
+            }
+            Some(PlayerActivity::Queued) => return Err(LobbyRepositoryError::PlayerQueued),
+            Some(PlayerActivity::Match(_)) => return Err(LobbyRepositoryError::PlayerInMatch),
+            None => {}
         }
 
+        activities.insert(owner_player_id, PlayerActivity::Lobby(lobby_id));
         store.player_lobbies.insert(owner_player_id, lobby_id);
         store.lobbies.insert(lobby_id, lobby.clone());
 
@@ -61,13 +81,18 @@ impl LobbyRepository for InMemoryLobbyRepository {
     }
 
     async fn join(&self, lobby_id: Uuid, player_id: Uuid) -> Result<Lobby, LobbyRepositoryError> {
+        let mut activities = self
+            .activity_registry
+            .activities
+            .write()
+            .map_err(|_| LobbyRepositoryError::Unavailable)?;
         let mut store = self
             .state
             .write()
             .map_err(|_| LobbyRepositoryError::Unavailable)?;
 
-        if let Some(current_lobby_id) = store.player_lobbies.get(&player_id) {
-            if *current_lobby_id == lobby_id {
+        if let Some(activity) = activities.get(&player_id) {
+            if *activity == PlayerActivity::Lobby(lobby_id) {
                 return store
                     .lobbies
                     .get(&lobby_id)
@@ -75,7 +100,11 @@ impl LobbyRepository for InMemoryLobbyRepository {
                     .ok_or(LobbyRepositoryError::LobbyNotFound);
             }
 
-            return Err(LobbyRepositoryError::PlayerAlreadyInLobby);
+            return match activity {
+                PlayerActivity::Lobby(_) => Err(LobbyRepositoryError::PlayerAlreadyInLobby),
+                PlayerActivity::Queued => Err(LobbyRepositoryError::PlayerQueued),
+                PlayerActivity::Match(_) => Err(LobbyRepositoryError::PlayerInMatch),
+            };
         }
 
         let updated_lobby = {
@@ -87,11 +116,17 @@ impl LobbyRepository for InMemoryLobbyRepository {
             lobby.clone()
         };
 
+        activities.insert(player_id, PlayerActivity::Lobby(lobby_id));
         store.player_lobbies.insert(player_id, lobby_id);
         Ok(updated_lobby)
     }
 
     async fn leave(&self, lobby_id: Uuid, player_id: Uuid) -> Result<Lobby, LobbyRepositoryError> {
+        let mut activities = self
+            .activity_registry
+            .activities
+            .write()
+            .map_err(|_| LobbyRepositoryError::Unavailable)?;
         let mut store = self
             .state
             .write()
@@ -101,7 +136,7 @@ impl LobbyRepository for InMemoryLobbyRepository {
             return Err(LobbyRepositoryError::LobbyNotFound);
         }
 
-        if store.player_lobbies.get(&player_id) != Some(&lobby_id) {
+        if activities.get(&player_id) != Some(&PlayerActivity::Lobby(lobby_id)) {
             return Err(LobbyRepositoryError::Lobby(
                 crate::domain::lobby::LobbyError::MemberNotFound,
             ));
@@ -116,6 +151,7 @@ impl LobbyRepository for InMemoryLobbyRepository {
             lobby.clone()
         };
 
+        activities.remove(&player_id);
         store.player_lobbies.remove(&player_id);
         Ok(updated_lobby)
     }

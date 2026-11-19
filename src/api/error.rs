@@ -5,7 +5,10 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::service::{lobby_service::LobbyServiceError, player_service::PlayerServiceError};
+use crate::service::{
+    lobby_service::LobbyServiceError, matchmaking_service::MatchmakingServiceError,
+    player_service::PlayerServiceError,
+};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -36,6 +39,22 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_lobby_id",
             message: "lobby_id must be a valid UUID",
+        }
+    }
+
+    pub fn invalid_match_id() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_match_id",
+            message: "match_id must be a valid UUID",
+        }
+    }
+
+    pub fn invalid_match_mode() -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_match_mode",
+            message: "mode must be either 1v1 or 2v2",
         }
     }
 
@@ -71,6 +90,16 @@ impl From<LobbyServiceError> for ApiError {
                 code: "player_already_in_lobby",
                 message: "player is already a member of another lobby",
             },
+            LobbyServiceError::PlayerQueued => Self {
+                status: StatusCode::CONFLICT,
+                code: "player_already_queued",
+                message: "player is already queued for matchmaking",
+            },
+            LobbyServiceError::PlayerInMatch => Self {
+                status: StatusCode::CONFLICT,
+                code: "player_in_match",
+                message: "player is already in a match",
+            },
             LobbyServiceError::LobbyFull => Self {
                 status: StatusCode::CONFLICT,
                 code: "lobby_full",
@@ -92,6 +121,46 @@ impl From<LobbyServiceError> for ApiError {
             }
             LobbyServiceError::LobbyRepository(source) => {
                 tracing::error!(%source, "lobby repository operation failed");
+                Self::internal()
+            }
+        }
+    }
+}
+
+impl From<MatchmakingServiceError> for ApiError {
+    fn from(error: MatchmakingServiceError) -> Self {
+        match error {
+            MatchmakingServiceError::PlayerNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "player_not_found",
+                message: "player was not found",
+            },
+            MatchmakingServiceError::MatchNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "match_not_found",
+                message: "match was not found",
+            },
+            MatchmakingServiceError::PlayerInLobby => Self {
+                status: StatusCode::CONFLICT,
+                code: "player_in_lobby",
+                message: "player must leave their lobby before queueing",
+            },
+            MatchmakingServiceError::PlayerAlreadyQueued => Self {
+                status: StatusCode::CONFLICT,
+                code: "player_already_queued",
+                message: "player is already queued for matchmaking",
+            },
+            MatchmakingServiceError::PlayerInMatch => Self {
+                status: StatusCode::CONFLICT,
+                code: "player_in_match",
+                message: "player is already in a match",
+            },
+            MatchmakingServiceError::PlayerRepository(source) => {
+                tracing::error!(%source, "player lookup for matchmaking failed");
+                Self::internal()
+            }
+            MatchmakingServiceError::MatchmakingRepository(source) => {
+                tracing::error!(%source, "matchmaking repository operation failed");
                 Self::internal()
             }
         }
