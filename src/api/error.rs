@@ -6,8 +6,8 @@ use axum::{
 use serde::Serialize;
 
 use crate::service::{
-    lobby_service::LobbyServiceError, matchmaking_service::MatchmakingServiceError,
-    player_service::PlayerServiceError,
+    dev_session_service::DevSessionError, lobby_service::LobbyServiceError,
+    matchmaking_service::MatchmakingServiceError, player_service::PlayerServiceError,
 };
 
 #[derive(Debug)]
@@ -58,11 +58,39 @@ impl ApiError {
         }
     }
 
+    pub fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: "a valid development bearer token for this player is required",
+        }
+    }
+
     pub async fn route_not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "route_not_found",
             message: "the requested route does not exist",
+        }
+    }
+}
+
+impl From<DevSessionError> for ApiError {
+    fn from(error: DevSessionError) -> Self {
+        match error {
+            DevSessionError::PlayerNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "player_not_found",
+                message: "player was not found",
+            },
+            DevSessionError::Unavailable => {
+                tracing::error!("development session store is unavailable");
+                Self::internal()
+            }
+            DevSessionError::PlayerRepository(source) => {
+                tracing::error!(%source, "player lookup for development session failed");
+                Self::internal()
+            }
         }
     }
 }

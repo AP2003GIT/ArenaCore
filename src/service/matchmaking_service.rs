@@ -16,6 +16,8 @@ use crate::{
     },
 };
 
+use super::notification_service::{NotificationHub, PlayerEvent};
+
 pub trait Clock: Send + Sync {
     fn now_seconds(&self) -> u64;
 }
@@ -37,6 +39,7 @@ pub struct MatchmakingService {
     matchmaking_repository: Arc<dyn MatchmakingRepository>,
     clock: Arc<dyn Clock>,
     config: MatchmakingConfig,
+    notifications: Arc<NotificationHub>,
 }
 
 impl MatchmakingService {
@@ -45,12 +48,14 @@ impl MatchmakingService {
         matchmaking_repository: Arc<dyn MatchmakingRepository>,
         clock: Arc<dyn Clock>,
         config: MatchmakingConfig,
+        notifications: Arc<NotificationHub>,
     ) -> Self {
         Self {
             player_repository,
             matchmaking_repository,
             clock,
             config,
+            notifications,
         }
     }
 
@@ -68,18 +73,28 @@ impl MatchmakingService {
         let now_seconds = self.clock.now_seconds();
         let entry = QueueEntry::new(player_id, player.rating(), mode, now_seconds);
 
-        self.matchmaking_repository
+        let result = self
+            .matchmaking_repository
             .enqueue(entry, now_seconds, self.config)
             .await
-            .map_err(map_repository_error)
+            .map_err(map_repository_error)?;
+
+        self.publish_matchmaking_result(player_id, result.status, &result.formed_matches);
+        Ok(result.status)
     }
 
     pub async fn cancel(&self, player_id: Uuid) -> Result<bool, MatchmakingServiceError> {
         self.ensure_player_exists(player_id).await?;
-        self.matchmaking_repository
+        let cancelled = self
+            .matchmaking_repository
             .cancel(player_id)
             .await
-            .map_err(map_repository_error)
+            .map_err(map_repository_error)?;
+        self.notifications.publish(
+            player_id,
+            PlayerEvent::queue_updated(player_id, PlayerMatchmakingStatus::Idle),
+        );
+        Ok(cancelled)
     }
 
     pub async fn status(
@@ -107,7 +122,58 @@ impl MatchmakingService {
             .run_pending(self.clock.now_seconds(), self.config)
             .await
             .map_err(map_repository_error)?;
+        for game_match in &matches {
+            self.publish_match(game_match);
+        }
         Ok(matches.len())
+    }
+
+    fn publish_matchmaking_result(
+        &self,
+        requested_player_id: Uuid,
+        requested_status: PlayerMatchmakingStatus,
+        matches: &[GameMatch],
+    ) {
+        if matches.is_empty() {
+            self.notifications.publish(
+                requested_player_id,
+                PlayerEvent::queue_updated(requested_player_id, requested_status),
+            );
+            return;
+        }
+
+        let requested_player_matched = matches.iter().any(|game_match| {
+            game_match
+                .players()
+                .any(|player| player.player_id() == requested_player_id)
+        });
+        if !requested_player_matched {
+            self.notifications.publish(
+                requested_player_id,
+                PlayerEvent::queue_updated(requested_player_id, requested_status),
+            );
+        }
+        for game_match in matches {
+            self.publish_match(game_match);
+        }
+    }
+
+    fn publish_match(&self, game_match: &GameMatch) {
+        for player in game_match.players() {
+            let player_id = player.player_id();
+            self.notifications.publish(
+                player_id,
+                PlayerEvent::queue_updated(
+                    player_id,
+                    PlayerMatchmakingStatus::Matched {
+                        match_id: game_match.id(),
+                        mode: game_match.mode(),
+                    },
+                ),
+            );
+            self.notifications
+                .publish(player_id, PlayerEvent::match_found(game_match));
+        }
     }
 
     async fn ensure_player_exists(&self, player_id: Uuid) -> Result<(), MatchmakingServiceError> {

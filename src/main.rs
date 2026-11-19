@@ -1,11 +1,13 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
 use arena_core::{
-    app::build_app,
+    app::{build_app, AppState},
     config::Config,
     service::{
+        dev_session_service::DevSessionService,
         lobby_service::LobbyService,
         matchmaking_service::{MatchmakingService, SystemClock},
+        notification_service::NotificationHub,
         player_service::PlayerService,
     },
     storage::{
@@ -34,14 +36,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let matchmaking_repository: Arc<dyn MatchmakingRepository> =
         Arc::new(InMemoryMatchmakingRepository::new(activity_registry));
     let player_service = PlayerService::new(Arc::clone(&player_repository));
-    let lobby_service = LobbyService::new(Arc::clone(&player_repository), lobby_repository);
+    let notification_hub = Arc::new(NotificationHub::default());
+    let lobby_service = LobbyService::new(
+        Arc::clone(&player_repository),
+        lobby_repository,
+        Arc::clone(&notification_hub),
+    );
     let matchmaking_service = MatchmakingService::new(
-        player_repository,
+        Arc::clone(&player_repository),
         matchmaking_repository,
         Arc::new(SystemClock),
         config.matchmaking_config(),
+        Arc::clone(&notification_hub),
     );
-    let app = build_app(player_service, lobby_service, matchmaking_service.clone());
+    let dev_session_service = DevSessionService::new(player_repository);
+    let app = build_app(AppState {
+        player_service,
+        lobby_service,
+        matchmaking_service: matchmaking_service.clone(),
+        dev_session_service,
+        notification_hub,
+        websocket_config: config.websocket_config(),
+    });
     let listener = TcpListener::bind(address).await?;
     let matchmaker_task = spawn_matchmaker(matchmaking_service);
 

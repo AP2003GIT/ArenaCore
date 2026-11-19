@@ -1,11 +1,14 @@
 use std::{collections::HashSet, sync::Arc};
 
 use arena_core::{
-    app::build_app,
+    app::{build_app, AppState},
+    config::WebSocketConfig,
     domain::matchmaking::MatchmakingConfig,
     service::{
+        dev_session_service::DevSessionService,
         lobby_service::LobbyService,
         matchmaking_service::{MatchmakingService, SystemClock},
+        notification_service::NotificationHub,
         player_service::PlayerService,
     },
     storage::{
@@ -33,14 +36,28 @@ fn test_app() -> Router {
     let matchmaking_repository: Arc<dyn MatchmakingRepository> =
         Arc::new(InMemoryMatchmakingRepository::new(activity_registry));
     let player_service = PlayerService::new(Arc::clone(&player_repository));
-    let lobby_service = LobbyService::new(Arc::clone(&player_repository), lobby_repository);
+    let notification_hub = Arc::new(NotificationHub::default());
+    let lobby_service = LobbyService::new(
+        Arc::clone(&player_repository),
+        lobby_repository,
+        Arc::clone(&notification_hub),
+    );
     let matchmaking_service = MatchmakingService::new(
-        player_repository,
+        Arc::clone(&player_repository),
         matchmaking_repository,
         Arc::new(SystemClock),
         MatchmakingConfig::default(),
+        Arc::clone(&notification_hub),
     );
-    build_app(player_service, lobby_service, matchmaking_service)
+    let dev_session_service = DevSessionService::new(player_repository);
+    build_app(AppState {
+        player_service,
+        lobby_service,
+        matchmaking_service,
+        dev_session_service,
+        notification_hub,
+        websocket_config: WebSocketConfig::default(),
+    })
 }
 
 fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {

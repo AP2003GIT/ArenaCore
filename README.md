@@ -1,6 +1,6 @@
 # ArenaCore
 
-ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 3 provide a runnable Axum service, development players, concurrency-safe lobbies, and deterministic 1v1 and 2v2 skill matchmaking. WebSocket delivery and PostgreSQL persistence are intentionally deferred.
+ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 4 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, and authenticated real-time player notifications. PostgreSQL persistence is intentionally deferred.
 
 ## Prerequisites
 
@@ -27,6 +27,9 @@ Configuration uses environment variables:
 | `ARENA_MATCH_BASE_GAP` | `100` | Initial allowed rating difference |
 | `ARENA_MATCH_GAP_GROWTH_PER_SECOND` | `10` | Rating points added to the window per second waited |
 | `ARENA_MATCH_MAX_GAP` | `1000` | Maximum allowed rating difference |
+| `ARENA_WS_CHANNEL_CAPACITY` | `32` | Maximum pending events per WebSocket connection |
+| `ARENA_WS_HEARTBEAT_SECONDS` | `15` | Interval between server ping frames |
+| `ARENA_WS_CLIENT_TIMEOUT_SECONDS` | `45` | Maximum time without client traffic before disconnect |
 
 PowerShell example:
 
@@ -126,6 +129,33 @@ For 2v2, the matcher first selects four mutually compatible players with the sma
 
 Matches enter `ready` and retain the players' ratings at assignment time. Completion, cancellation after assignment, and rating updates belong to later match-lifecycle work.
 
+### Real-time notifications
+
+Issue a development access token for an existing player:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/dev/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"player_id":"00000000-0000-0000-0000-000000000000"}'
+```
+
+Connect to `ws://127.0.0.1:3000/api/v1/ws?player_id={player_id}` with the response token in an `Authorization: Bearer {access_token}` header. A token is bound to exactly one player, so changing `player_id` cannot subscribe to another player's events. The session endpoint and its in-memory bearer tokens are development scaffolding; production deployments should replace them with the platform identity provider and short-lived signed credentials.
+
+The server sends JSON text frames with a stable envelope:
+
+```json
+{
+  "type": "match_found",
+  "event_id": "00000000-0000-0000-0000-000000000000",
+  "occurred_at": "2026-11-19T12:00:00Z",
+  "payload": {}
+}
+```
+
+Current event types are `lobby_updated`, `queue_updated`, and `match_found`. Lobby membership and ready-state changes notify all affected members. Matchmaking events are emitted from the service layer for both HTTP-triggered and background matches.
+
+Each connection has its own bounded event channel. A connection that cannot consume events before its channel fills is removed instead of allowing unbounded memory growth. The server sends ping frames at the configured heartbeat interval, treats pong or other client traffic as liveness, and unregisters the subscription on close, transport failure, timeout, or backpressure removal. Clients should reconnect and fetch current HTTP state after any disconnect because notification delivery is intentionally ephemeral.
+
 Errors use a stable envelope:
 
 ```json
@@ -141,13 +171,13 @@ Errors use a stable envelope:
 
 - `api` owns HTTP handlers, request/response DTOs, and transport error mapping.
 - `domain` owns players, lobbies, queues, match snapshots, matching policy, and state invariants, independent of Axum.
-- `service` owns validation and the player, lobby, and matchmaking use cases.
+- `service` owns validation, player/lobby/matchmaking use cases, development sessions, and notification fan-out.
 - `storage` defines repository boundaries and concurrency-safe in-memory implementations.
 - `app` wires routes to application state, while `main` handles process concerns such as configuration, tracing, listening, and shutdown.
 
 The in-memory repositories use standard-library `RwLock` values. Their critical sections contain only short state transitions and never cross an `.await`. A shared player-activity registry atomically prevents lobby, queue, and match membership from overlapping. Match formation and queue removal occur under one narrow write lock, so concurrent requests cannot assign a player twice. The repository traits are asynchronous so later SQLx implementations can perform real I/O without changing the service API.
 
-Player, lobby, queue, and match data are lost whenever the process restarts; persistence belongs to a later milestone.
+Player, lobby, queue, match, and development-session data are lost whenever the process restarts; persistence belongs to a later milestone.
 
 ## Checks and tests
 
@@ -157,5 +187,5 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The tests exercise health, player behavior, validation, concurrent creation and joins, lobby lifecycle rules, cross-activity conflicts, duplicate queue defense, idempotent cancellation, 1v1 assignment, wait-based gap expansion, deterministic 2v2 balancing, status reads, and match reads. They do not require a database or external game client.
+The tests exercise health, player behavior, validation, concurrent creation and joins, lobby lifecycle rules, cross-activity conflicts, duplicate queue defense, idempotent cancellation, 1v1 assignment, wait-based gap expansion, deterministic 2v2 balancing, status reads, match reads, token/player binding, WebSocket event delivery, heartbeat handling, bounded-channel backpressure, and disconnect cleanup. They do not require a database or external game client.
 

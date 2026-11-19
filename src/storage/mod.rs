@@ -41,7 +41,7 @@ pub trait MatchmakingRepository: Send + Sync {
         entry: QueueEntry,
         now_seconds: u64,
         config: MatchmakingConfig,
-    ) -> Result<PlayerMatchmakingStatus, MatchmakingRepositoryError>;
+    ) -> Result<EnqueueResult, MatchmakingRepositoryError>;
     async fn cancel(&self, player_id: Uuid) -> Result<bool, MatchmakingRepositoryError>;
     async fn status(
         &self,
@@ -56,6 +56,11 @@ pub trait MatchmakingRepository: Send + Sync {
         now_seconds: u64,
         config: MatchmakingConfig,
     ) -> Result<Vec<GameMatch>, MatchmakingRepositoryError>;
+}
+
+pub struct EnqueueResult {
+    pub status: PlayerMatchmakingStatus,
+    pub formed_matches: Vec<GameMatch>,
 }
 
 #[derive(Debug, Error)]

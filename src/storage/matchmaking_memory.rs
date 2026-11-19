@@ -13,7 +13,7 @@ use crate::{
     },
     storage::{
         activity::{PlayerActivity, PlayerActivityRegistry},
-        MatchmakingRepository, MatchmakingRepositoryError,
+        EnqueueResult, MatchmakingRepository, MatchmakingRepositoryError,
     },
 };
 
@@ -38,7 +38,7 @@ impl MatchmakingRepository for InMemoryMatchmakingRepository {
         entry: QueueEntry,
         now_seconds: u64,
         config: MatchmakingConfig,
-    ) -> Result<PlayerMatchmakingStatus, MatchmakingRepositoryError> {
+    ) -> Result<EnqueueResult, MatchmakingRepositoryError> {
         let player_id = entry.player_id();
         let mut activities = self
             .activity_registry
@@ -69,7 +69,10 @@ impl MatchmakingRepository for InMemoryMatchmakingRepository {
         let matches = state.form_available_matches(now_seconds, config);
         update_matched_activities(&mut activities, &matches);
 
-        Ok(state.status(player_id))
+        Ok(EnqueueResult {
+            status: state.status(player_id),
+            formed_matches: matches,
+        })
     }
 
     async fn cancel(&self, player_id: Uuid) -> Result<bool, MatchmakingRepositoryError> {
