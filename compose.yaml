@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:18.7-alpine3.24
+    environment:
+      POSTGRES_DB: arenacore
+      POSTGRES_USER: arena
+      POSTGRES_PASSWORD: arena
+    ports:
+      - "55432:5432"
+    volumes:
+      - arenacore-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arena -d arenacore"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+    environment:
+      ARENA_HOST: 0.0.0.0
+      ARENA_PORT: 3000
+      ARENA_STORAGE: postgres
+      ARENA_DATABASE_URL: postgresql://arena:arena@postgres:5432/arenacore
+      RUST_LOG: arena_core=info
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  arenacore-postgres:

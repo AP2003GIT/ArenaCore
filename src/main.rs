@@ -1,8 +1,9 @@
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use arena_core::{
     app::{build_app, AppState},
-    config::Config,
+    config::{Config, StorageBackend},
+    operations::{OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
@@ -11,8 +12,12 @@ use arena_core::{
         player_service::PlayerService,
     },
     storage::{
-        activity::PlayerActivityRegistry, lobby_memory::InMemoryLobbyRepository,
-        matchmaking_memory::InMemoryMatchmakingRepository, memory::InMemoryPlayerRepository,
+        activity::PlayerActivityRegistry,
+        lobby_memory::InMemoryLobbyRepository,
+        matchmaking_memory::InMemoryMatchmakingRepository,
+        memory::InMemoryPlayerRepository,
+        postgres::PostgresRepository,
+        readiness::{InMemoryReadiness, PostgresReadiness, ReadinessProbe},
         LobbyRepository, MatchmakingRepository, PlayerRepository,
     },
 };
@@ -29,27 +34,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = Config::from_env()?;
     let address = config.socket_address();
-    let activity_registry = Arc::new(PlayerActivityRegistry::new());
-    let player_repository: Arc<dyn PlayerRepository> = Arc::new(InMemoryPlayerRepository::new());
-    let lobby_repository: Arc<dyn LobbyRepository> =
-        Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry)));
-    let matchmaking_repository: Arc<dyn MatchmakingRepository> =
-        Arc::new(InMemoryMatchmakingRepository::new(activity_registry));
-    let player_service = PlayerService::new(Arc::clone(&player_repository));
+    let repositories = match config.database_config().backend() {
+        StorageBackend::Memory => {
+            let activity_registry = Arc::new(PlayerActivityRegistry::new());
+            RepositorySet {
+                players: Arc::new(InMemoryPlayerRepository::new()),
+                lobbies: Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry))),
+                matchmaking: Arc::new(InMemoryMatchmakingRepository::new(activity_registry)),
+                readiness: Arc::new(InMemoryReadiness),
+            }
+        }
+        StorageBackend::Postgres => {
+            let database = config.database_config();
+            let repository = Arc::new(
+                PostgresRepository::connect(
+                    database
+                        .url()
+                        .expect("PostgreSQL URL is validated during configuration"),
+                    database.max_connections(),
+                    database.acquire_timeout(),
+                )
+                .await?,
+            );
+            RepositorySet {
+                players: repository.clone(),
+                lobbies: repository.clone(),
+                matchmaking: repository.clone(),
+                readiness: Arc::new(PostgresReadiness::new(repository.pool().clone())),
+            }
+        }
+    };
+    let player_service = PlayerService::new(Arc::clone(&repositories.players));
     let notification_hub = Arc::new(NotificationHub::default());
     let lobby_service = LobbyService::new(
-        Arc::clone(&player_repository),
-        lobby_repository,
+        Arc::clone(&repositories.players),
+        repositories.lobbies,
         Arc::clone(&notification_hub),
     );
     let matchmaking_service = MatchmakingService::new(
-        Arc::clone(&player_repository),
-        matchmaking_repository,
+        Arc::clone(&repositories.players),
+        repositories.matchmaking,
         Arc::new(SystemClock),
         config.matchmaking_config(),
         Arc::clone(&notification_hub),
     );
-    let dev_session_service = DevSessionService::new(player_repository);
+    let dev_session_service = DevSessionService::new(repositories.players);
+    let metrics = Arc::new(OperationalMetrics::default());
+    let rate_limiter = Arc::new(RateLimiter::new(
+        config.rate_limit_config(),
+        Arc::clone(&metrics),
+    ));
     let app = build_app(AppState {
         player_service,
         lobby_service,
@@ -57,18 +91,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dev_session_service,
         notification_hub,
         websocket_config: config.websocket_config(),
+        readiness_probe: repositories.readiness,
+        metrics,
+        rate_limiter,
     });
     let listener = TcpListener::bind(address).await?;
     let matchmaker_task = spawn_matchmaker(matchmaking_service);
 
     tracing::info!(%address, "ArenaCore server listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     matchmaker_task.abort();
 
     Ok(())
+}
+
+struct RepositorySet {
+    players: Arc<dyn PlayerRepository>,
+    lobbies: Arc<dyn LobbyRepository>,
+    matchmaking: Arc<dyn MatchmakingRepository>,
+    readiness: Arc<dyn ReadinessProbe>,
 }
 
 fn spawn_matchmaker(service: MatchmakingService) -> JoinHandle<()> {

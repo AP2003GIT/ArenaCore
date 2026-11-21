@@ -1,0 +1,10 @@
+{
+  "name": "local-health-throughput",
+  "base_url": "http://127.0.0.1:3000",
+  "concurrency": 32,
+  "timeout_seconds": 10,
+  "workload": {
+    "kind": "health",
+    "requests": 5000
+  }
+}

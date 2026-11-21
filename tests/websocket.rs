@@ -2,8 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use arena_core::{
     app::{build_app, AppState},
-    config::WebSocketConfig,
+    config::{RateLimitConfig, WebSocketConfig},
     domain::matchmaking::MatchmakingConfig,
+    operations::{OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
@@ -14,7 +15,7 @@ use arena_core::{
     storage::{
         activity::PlayerActivityRegistry, lobby_memory::InMemoryLobbyRepository,
         matchmaking_memory::InMemoryMatchmakingRepository, memory::InMemoryPlayerRepository,
-        LobbyRepository, MatchmakingRepository, PlayerRepository,
+        readiness::InMemoryReadiness, LobbyRepository, MatchmakingRepository, PlayerRepository,
     },
 };
 use axum::{
@@ -69,6 +70,11 @@ fn test_app() -> TestApp {
     let dev_session_service = DevSessionService::new(player_repository);
     let websocket_config =
         WebSocketConfig::new(8, Duration::from_millis(50), Duration::from_millis(250)).unwrap();
+    let metrics = Arc::new(OperationalMetrics::default());
+    let rate_limiter = Arc::new(RateLimiter::new(
+        RateLimitConfig::default(),
+        Arc::clone(&metrics),
+    ));
     let router = build_app(AppState {
         player_service,
         lobby_service,
@@ -76,6 +82,9 @@ fn test_app() -> TestApp {
         dev_session_service,
         notification_hub: Arc::clone(&notifications),
         websocket_config,
+        readiness_probe: Arc::new(InMemoryReadiness),
+        metrics,
+        rate_limiter,
     });
 
     TestApp {

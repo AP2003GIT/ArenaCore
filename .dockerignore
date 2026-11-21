@@ -1,0 +1,6 @@
+target
+.tools
+.git
+.env
+.tmp_docx_render
+*.log

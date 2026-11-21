@@ -2,8 +2,9 @@ use std::{collections::HashSet, sync::Arc};
 
 use arena_core::{
     app::{build_app, AppState},
-    config::WebSocketConfig,
+    config::{RateLimitConfig, WebSocketConfig},
     domain::matchmaking::MatchmakingConfig,
+    operations::{OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
@@ -14,7 +15,7 @@ use arena_core::{
     storage::{
         activity::PlayerActivityRegistry, lobby_memory::InMemoryLobbyRepository,
         matchmaking_memory::InMemoryMatchmakingRepository, memory::InMemoryPlayerRepository,
-        LobbyRepository, MatchmakingRepository, PlayerRepository,
+        readiness::InMemoryReadiness, LobbyRepository, MatchmakingRepository, PlayerRepository,
     },
 };
 use axum::{
@@ -29,6 +30,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 fn test_app() -> Router {
+    test_app_with_rate_limit(RateLimitConfig::default())
+}
+
+fn test_app_with_rate_limit(rate_limit_config: RateLimitConfig) -> Router {
     let activity_registry = Arc::new(PlayerActivityRegistry::new());
     let player_repository: Arc<dyn PlayerRepository> = Arc::new(InMemoryPlayerRepository::new());
     let lobby_repository: Arc<dyn LobbyRepository> =
@@ -50,6 +55,8 @@ fn test_app() -> Router {
         Arc::clone(&notification_hub),
     );
     let dev_session_service = DevSessionService::new(player_repository);
+    let metrics = Arc::new(OperationalMetrics::default());
+    let rate_limiter = Arc::new(RateLimiter::new(rate_limit_config, Arc::clone(&metrics)));
     build_app(AppState {
         player_service,
         lobby_service,
@@ -57,6 +64,9 @@ fn test_app() -> Router {
         dev_session_service,
         notification_hub,
         websocket_config: WebSocketConfig::default(),
+        readiness_probe: Arc::new(InMemoryReadiness),
+        metrics,
+        rate_limiter,
     })
 }
 
@@ -130,6 +140,80 @@ async fn health_returns_ok() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await, json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn readiness_and_metrics_are_operational() {
+    let app = test_app();
+    let ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    assert_eq!(response_json(ready).await["status"], "ready");
+
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        metrics
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("arena_http_requests_total 1"));
+    assert!(body.contains("arena_websocket_connections 0"));
+}
+
+#[tokio::test]
+async fn api_rate_limit_returns_stable_error_and_retry_after() {
+    let app = test_app_with_rate_limit(
+        RateLimitConfig::new(1, std::time::Duration::from_secs(60)).unwrap(),
+    );
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/players/00000000-0000-0000-0000-000000000000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::NOT_FOUND);
+
+    let limited = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/players/00000000-0000-0000-0000-000000000000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers().contains_key("retry-after"));
+    assert_eq!(
+        response_json(limited).await["error"]["code"],
+        "rate_limited"
+    );
 }
 
 #[tokio::test]

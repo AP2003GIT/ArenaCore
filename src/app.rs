@@ -1,18 +1,21 @@
 use std::sync::Arc;
 
 use axum::{
+    middleware,
     routing::{delete, get, post},
     Router,
 };
 
 use crate::{
-    api::{error::ApiError, health::health, lobbies, matchmaking, players, sessions, ws},
+    api::{error::ApiError, health, lobbies, matchmaking, players, sessions, ws},
     config::WebSocketConfig,
+    operations::{enforce_rate_limit, observe_requests, OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService, lobby_service::LobbyService,
         matchmaking_service::MatchmakingService, notification_service::NotificationHub,
         player_service::PlayerService,
     },
+    storage::readiness::ReadinessProbe,
 };
 
 #[derive(Clone)]
@@ -23,11 +26,13 @@ pub struct AppState {
     pub dev_session_service: DevSessionService,
     pub notification_hub: Arc<NotificationHub>,
     pub websocket_config: WebSocketConfig,
+    pub readiness_probe: Arc<dyn ReadinessProbe>,
+    pub metrics: Arc<OperationalMetrics>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 pub fn build_app(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let api = Router::new()
         .route("/api/v1/players", post(players::create_player))
         .route("/api/v1/players/{player_id}", get(players::get_player))
         .route("/api/v1/lobbies", post(lobbies::create_lobby))
@@ -50,6 +55,19 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/matches/{match_id}", get(matchmaking::get_match))
         .route("/api/v1/dev/sessions", post(sessions::create_dev_session))
         .route("/api/v1/ws", get(ws::connect))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state.rate_limiter),
+            enforce_rate_limit,
+        ));
+    Router::new()
+        .route("/health", get(health::health))
+        .route("/ready", get(health::readiness))
+        .route("/metrics", get(health::metrics))
+        .merge(api)
         .fallback(ApiError::route_not_found)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state.metrics),
+            observe_requests,
+        ))
         .with_state(state)
 }

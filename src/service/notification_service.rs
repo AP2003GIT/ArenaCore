@@ -158,6 +158,15 @@ impl NotificationHub {
             .get(&player_id)
             .map_or(0, HashMap::len)
     }
+
+    pub fn total_connection_count(&self) -> usize {
+        self.connections
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .map(HashMap::len)
+            .sum()
+    }
 }
 
 #[cfg(test)]

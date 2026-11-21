@@ -1,11 +1,12 @@
 # ArenaCore
 
-ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 4 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, and authenticated real-time player notifications. PostgreSQL persistence is intentionally deferred.
+ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 6 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, authenticated real-time notifications, PostgreSQL persistence, operational safeguards, a deterministic load harness, and game-engine integration contracts.
 
 ## Prerequisites
 
 - A current stable Rust toolchain with Cargo
 - `curl` or another HTTP client
+- Docker with Compose for the PostgreSQL deployment path
 
 Install Rust from [rustup.rs](https://rustup.rs/) if `cargo --version` is not available.
 
@@ -24,6 +25,12 @@ Configuration uses environment variables:
 | `ARENA_HOST` | `127.0.0.1` | IP address on which the server listens |
 | `ARENA_PORT` | `3000` | TCP port on which the server listens |
 | `RUST_LOG` | `arena_core=info` | Tracing filter |
+| `ARENA_STORAGE` | `memory` | Repository backend: `memory` or `postgres` |
+| `ARENA_DATABASE_URL` | none | PostgreSQL URL; required when storage is `postgres` |
+| `ARENA_DB_MAX_CONNECTIONS` | `10` | Maximum SQLx pool connections |
+| `ARENA_DB_ACQUIRE_TIMEOUT_SECONDS` | `5` | Maximum wait for a pooled connection |
+| `ARENA_RATE_LIMIT_REQUESTS` | `120` | Requests allowed per client in one rate-limit window |
+| `ARENA_RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window length |
 | `ARENA_MATCH_BASE_GAP` | `100` | Initial allowed rating difference |
 | `ARENA_MATCH_GAP_GROWTH_PER_SECOND` | `10` | Rating points added to the window per second waited |
 | `ARENA_MATCH_MAX_GAP` | `1000` | Maximum allowed rating difference |
@@ -40,6 +47,33 @@ cargo run
 ```
 
 The included `.env.example` documents these values. The service intentionally does not load `.env` automatically, which keeps configuration behavior explicit across local and production environments.
+
+## Deploy with Docker Compose
+
+Build and start the API with PostgreSQL:
+
+```bash
+docker compose up --build -d
+docker compose ps
+```
+
+The Compose stack exposes the API on `127.0.0.1:3000` and PostgreSQL on `127.0.0.1:55432`. The non-default host database port avoids collisions with an existing PostgreSQL installation. Compose waits for the database health check before starting ArenaCore. The application embeds and applies SQLx migrations during startup, and `/ready` stays unavailable when PostgreSQL cannot answer a probe.
+
+Check the deployed services:
+
+```bash
+curl http://127.0.0.1:3000/health
+curl http://127.0.0.1:3000/ready
+curl http://127.0.0.1:3000/metrics
+```
+
+Stop the stack while retaining PostgreSQL data:
+
+```bash
+docker compose down
+```
+
+For a host-run API with only PostgreSQL in Docker, start `docker compose up -d postgres`, set `ARENA_STORAGE=postgres` and `ARENA_DATABASE_URL=postgresql://arena:arena@127.0.0.1:55432/arenacore`, then run `cargo run`.
 
 ## API examples
 
@@ -156,6 +190,12 @@ Current event types are `lobby_updated`, `queue_updated`, and `match_found`. Lob
 
 Each connection has its own bounded event channel. A connection that cannot consume events before its channel fills is removed instead of allowing unbounded memory growth. The server sends ping frames at the configured heartbeat interval, treats pong or other client traffic as liveness, and unregisters the subscription on close, transport failure, timeout, or backpressure removal. Clients should reconnect and fetch current HTTP state after any disconnect because notification delivery is intentionally ephemeral.
 
+### Operations
+
+`GET /health` is a process-liveness check. `GET /ready` verifies the configured storage backend and returns `503 Service Unavailable` if PostgreSQL is unreachable. `GET /metrics` returns Prometheus text metrics for request counts, 4xx/5xx responses, rate-limit rejections, aggregate request duration, and active WebSocket connections.
+
+Rate limiting applies to `/api/v1` routes and uses the connection peer IP when the server is running normally. Operational endpoints remain available to orchestrators and monitoring systems. Rejected requests return `429 Too Many Requests`, a `Retry-After` header, and the standard `rate_limited` error envelope. The built-in limiter is intentionally process-local; a multi-replica deployment should enforce a shared limit at the gateway or use a distributed store.
+
 Errors use a stable envelope:
 
 ```json
@@ -172,12 +212,40 @@ Errors use a stable envelope:
 - `api` owns HTTP handlers, request/response DTOs, and transport error mapping.
 - `domain` owns players, lobbies, queues, match snapshots, matching policy, and state invariants, independent of Axum.
 - `service` owns validation, player/lobby/matchmaking use cases, development sessions, and notification fan-out.
-- `storage` defines repository boundaries and concurrency-safe in-memory implementations.
+- `storage` defines repository boundaries plus in-memory and SQLx PostgreSQL implementations.
+- `operations` owns request metrics and the bounded per-client rate limiter.
 - `app` wires routes to application state, while `main` handles process concerns such as configuration, tracing, listening, and shutdown.
 
-The in-memory repositories use standard-library `RwLock` values. Their critical sections contain only short state transitions and never cross an `.await`. A shared player-activity registry atomically prevents lobby, queue, and match membership from overlapping. Match formation and queue removal occur under one narrow write lock, so concurrent requests cannot assign a player twice. The repository traits are asynchronous so later SQLx implementations can perform real I/O without changing the service API.
+The in-memory repositories use standard-library `RwLock` values. Their critical sections contain only short state transitions and never cross an `.await`. A shared player-activity registry atomically prevents lobby, queue, and match membership from overlapping.
 
-Player, lobby, queue, match, and development-session data are lost whenever the process restarts; persistence belongs to a later milestone.
+The PostgreSQL implementation stores players, lobbies, memberships, queue entries, match snapshots, match players, active-player ownership, and append-only match history. Lobby mutations lock the affected rows and commit membership, owner, status, and activity changes in one transaction. Matchmaking uses one PostgreSQL advisory transaction lock to serialize queue selection across API and background workers; this favors correctness and simple recovery over maximum matching throughput. Match creation, queue removal, player activity updates, and the first history entry commit atomically.
+
+Memory mode remains the default for fast development and database-free tests. Development bearer sessions and live WebSocket delivery are process-local in both modes.
+
+## Game integration and load testing
+
+The engine-neutral client contract documents the exact HTTP payloads, player-bound WebSocket handshake, reconnect behavior, retry rules, and current boundary between matchmaking and gameplay. Small reference clients show the same request flow with Unity `UnityWebRequest`, Unreal `FHttpModule`, and Godot `HTTPRequest`:
+
+- [Game client contract](docs/game-client-contract.md)
+- [Unity example](examples/clients/unity/ArenaCoreClient.cs)
+- [Unreal example](examples/clients/unreal/ArenaCoreClient.cpp)
+- [Godot example](examples/clients/godot/arena_core_client.gd)
+
+Run the four-player correctness scenario against a healthy deployment:
+
+```bash
+cargo run --release --bin arena-load -- \
+  --scenario load/scenarios/smoke.json \
+  --output target/load-reports/smoke.json
+```
+
+The harness supports health throughput and deterministic 1v1 or 2v2 workloads. Reports include operation-level latency percentiles, HTTP throughput, failure counts, assignments, matches, WebSocket handshakes, and `match_found` delivery. For intentional high-volume runs, start Compose with the load override:
+
+```bash
+docker compose -f compose.yaml -f compose.load.yaml up --build -d
+```
+
+See [load testing and profiling](docs/load-testing.md) for the scenario schema, reproducible benchmark procedure, report interpretation, symbol-rich profiling build, and database investigation workflow.
 
 ## Checks and tests
 
@@ -187,5 +255,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The tests exercise health, player behavior, validation, concurrent creation and joins, lobby lifecycle rules, cross-activity conflicts, duplicate queue defense, idempotent cancellation, 1v1 assignment, wait-based gap expansion, deterministic 2v2 balancing, status reads, match reads, token/player binding, WebSocket event delivery, heartbeat handling, bounded-channel backpressure, and disconnect cleanup. They do not require a database or external game client.
+The default suite exercises health/readiness, metrics, rate limits, player behavior, validation, concurrent creation and joins, lobby lifecycle rules, cross-activity conflicts, duplicate queue defense, idempotent cancellation, 1v1 assignment, wait-based gap expansion, deterministic 2v2 balancing, status reads, match reads, token/player binding, WebSocket event delivery, heartbeat handling, bounded-channel backpressure, disconnect cleanup, load-scenario validation, deterministic simulated ratings, and latency percentile calculations.
+
+The PostgreSQL integration test is opt-in so the normal suite remains database-free:
+
+```bash
+docker compose up -d postgres
+ARENA_TEST_DATABASE_URL=postgresql://arena:arena@127.0.0.1:55432/arenacore cargo test --test postgres
+```
+
+The database test applies migrations, clears only the configured test database, stresses concurrent joins, verifies cross-activity conflicts, forms and reloads a match, checks history, and reconnects through a fresh pool. Use a dedicated disposable database URL in CI.
 

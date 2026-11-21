@@ -16,6 +16,15 @@ impl LobbyStatus {
             Self::Closed => "closed",
         }
     }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "ready" => Some(Self::Ready),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +34,10 @@ pub struct LobbyMember {
 }
 
 impl LobbyMember {
+    pub(crate) fn restore(player_id: Uuid, ready: bool) -> Self {
+        Self { player_id, ready }
+    }
+
     pub fn player_id(&self) -> Uuid {
         self.player_id
     }
@@ -54,6 +67,22 @@ impl Lobby {
                 player_id: owner_player_id,
                 ready: false,
             }],
+        }
+    }
+
+    pub(crate) fn restore(
+        id: Uuid,
+        owner_player_id: Option<Uuid>,
+        capacity: u8,
+        status: LobbyStatus,
+        members: Vec<LobbyMember>,
+    ) -> Self {
+        Self {
+            id,
+            owner_player_id,
+            capacity,
+            status,
+            members,
         }
     }
 

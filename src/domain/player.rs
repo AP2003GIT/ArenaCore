@@ -16,6 +16,14 @@ impl Player {
         }
     }
 
+    pub(crate) fn restore(id: Uuid, display_name: String, rating: u16) -> Self {
+        Self {
+            id,
+            display_name,
+            rating,
+        }
+    }
+
     pub fn id(&self) -> Uuid {
         self.id
     }

@@ -2,6 +2,8 @@ pub mod activity;
 pub mod lobby_memory;
 pub mod matchmaking_memory;
 pub mod memory;
+pub mod postgres;
+pub mod readiness;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -69,6 +71,8 @@ pub enum RepositoryError {
     AlreadyExists,
     #[error("repository lock is unavailable")]
     Unavailable,
+    #[error("database operation failed")]
+    Database(#[source] sqlx::Error),
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +89,10 @@ pub enum LobbyRepositoryError {
     PlayerInMatch,
     #[error("lobby repository lock is unavailable")]
     Unavailable,
+    #[error("database operation failed")]
+    Database(#[source] sqlx::Error),
+    #[error("database contained an invalid lobby state")]
+    InvalidStoredState,
     #[error(transparent)]
     Lobby(#[from] LobbyError),
 }
@@ -101,6 +109,10 @@ pub enum MatchmakingRepositoryError {
     Unavailable,
     #[error("player activity and queue state are inconsistent")]
     InconsistentState,
+    #[error("database operation failed")]
+    Database(#[source] sqlx::Error),
+    #[error("database contained an invalid matchmaking state")]
+    InvalidStoredState,
     #[error(transparent)]
     State(#[from] MatchmakingStateError),
 }

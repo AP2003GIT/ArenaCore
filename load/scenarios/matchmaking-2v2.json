@@ -1,0 +1,16 @@
+{
+  "name": "local-matchmaking-2v2",
+  "base_url": "http://127.0.0.1:3000",
+  "concurrency": 32,
+  "timeout_seconds": 30,
+  "workload": {
+    "kind": "matchmaking",
+    "players": 100,
+    "mode": "2v2",
+    "connect_websockets": false,
+    "rating_seed": 20261121,
+    "rating_center": 1200,
+    "rating_spread": 40,
+    "poll_interval_ms": 50
+  }
+}

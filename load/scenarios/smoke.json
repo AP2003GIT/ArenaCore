@@ -1,0 +1,16 @@
+{
+  "name": "local-matchmaking-smoke",
+  "base_url": "http://127.0.0.1:3000",
+  "concurrency": 4,
+  "timeout_seconds": 20,
+  "workload": {
+    "kind": "matchmaking",
+    "players": 4,
+    "mode": "2v2",
+    "connect_websockets": true,
+    "rating_seed": 42,
+    "rating_center": 1200,
+    "rating_spread": 40,
+    "poll_interval_ms": 50
+  }
+}

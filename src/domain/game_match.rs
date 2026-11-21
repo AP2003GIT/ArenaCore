@@ -14,6 +14,14 @@ impl MatchMode {
         }
     }
 
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "1v1" => Some(Self::OneVsOne),
+            "2v2" => Some(Self::TwoVsTwo),
+            _ => None,
+        }
+    }
+
     pub fn required_players(self) -> usize {
         match self {
             Self::OneVsOne => 2,
@@ -31,6 +39,13 @@ impl MatchStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "ready",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ready" => Some(Self::Ready),
+            _ => None,
         }
     }
 }
@@ -70,6 +85,22 @@ impl GameMatch {
             id: Uuid::new_v4(),
             mode,
             status: MatchStatus::Ready,
+            team_a,
+            team_b,
+        }
+    }
+
+    pub(crate) fn restore(
+        id: Uuid,
+        mode: MatchMode,
+        status: MatchStatus,
+        team_a: Vec<MatchPlayer>,
+        team_b: Vec<MatchPlayer>,
+    ) -> Self {
+        Self {
+            id,
+            mode,
+            status,
             team_a,
             team_b,
         }
