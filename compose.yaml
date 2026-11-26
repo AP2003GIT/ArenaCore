@@ -24,6 +24,9 @@ services:
       ARENA_PORT: 3000
       ARENA_STORAGE: postgres
       ARENA_DATABASE_URL: postgresql://arena:arena@postgres:5432/arenacore
+      ARENA_MATCH_ALLOW_DEV_PARTICIPANTS: ${ARENA_MATCH_ALLOW_DEV_PARTICIPANTS:-false}
+      ARENA_MATCH_GAME_SERVER_PUBLIC_KEY: ${ARENA_MATCH_GAME_SERVER_PUBLIC_KEY:-}
+      ARENA_MATCH_ADMIN_PUBLIC_KEY: ${ARENA_MATCH_ADMIN_PUBLIC_KEY:-}
       RUST_LOG: arena_core=info
     ports:
       - "3000:3000"

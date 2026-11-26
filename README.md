@@ -1,93 +1,96 @@
 # ArenaCore
 
-ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 8 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, an atomic match lifecycle with Elo rating updates, scoped signed match authority, authenticated real-time notifications, PostgreSQL persistence, operational safeguards, a deterministic load harness, and game-engine integration contracts.
+ArenaCore is the backend for an online multiplayer game. It helps a game create players, gather them into lobbies, find fair matches, track match results, and keep player ratings up to date.
 
-## Prerequisites
+You can use it with a game made in Unity, Unreal, Godot, or another engine. ArenaCore handles the online services around a match; it does not run the game itself or simulate movement and combat.
 
-- A current stable Rust toolchain with Cargo
-- `curl` or another HTTP client
-- Docker with Compose for the PostgreSQL deployment path
+## What it does
 
-Install Rust from [rustup.rs](https://rustup.rs/) if `cargo --version` is not available.
+- Creates and stores player profiles and skill ratings.
+- Lets players join lobbies or enter matchmaking.
+- Finds balanced 1v1 and 2v2 matches.
+- Tracks each match from ready to active to completed or cancelled.
+- Updates ratings after a match and keeps a record of the result.
+- Sends live lobby and match updates to connected players.
+- Saves data in PostgreSQL when running in database mode.
 
-## Run locally
+## Start ArenaCore
 
-```bash
-cargo run
-```
+You can run the service with Docker, or run it directly with Rust.
 
-The server listens on `127.0.0.1:3000` by default. Stop it with `Ctrl+C`; the server waits for in-flight work to finish before exiting.
+### Option 1: Docker Compose
 
-Configuration uses environment variables:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ARENA_HOST` | `127.0.0.1` | IP address on which the server listens |
-| `ARENA_PORT` | `3000` | TCP port on which the server listens |
-| `RUST_LOG` | `arena_core=info` | Tracing filter |
-| `ARENA_STORAGE` | `memory` | Repository backend: `memory` or `postgres` |
-| `ARENA_DATABASE_URL` | none | PostgreSQL URL; required when storage is `postgres` |
-| `ARENA_DB_MAX_CONNECTIONS` | `10` | Maximum SQLx pool connections |
-| `ARENA_DB_ACQUIRE_TIMEOUT_SECONDS` | `5` | Maximum wait for a pooled connection |
-| `ARENA_RATE_LIMIT_REQUESTS` | `120` | Requests allowed per client in one rate-limit window |
-| `ARENA_RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window length |
-| `ARENA_MATCH_BASE_GAP` | `100` | Initial allowed rating difference |
-| `ARENA_MATCH_GAP_GROWTH_PER_SECOND` | `10` | Rating points added to the window per second waited |
-| `ARENA_MATCH_MAX_GAP` | `1000` | Maximum allowed rating difference |
-| `ARENA_RATING_K_FACTOR` | `32` | Elo rating sensitivity; must be from 1 through 128 |
-| `ARENA_MATCH_ALLOW_DEV_PARTICIPANTS` | `false` | Allow participant match commands with a development session token |
-| `ARENA_MATCH_GAME_SERVER_PUBLIC_KEY` | unset | Optional raw Ed25519 public key, unpadded base64url, for game-server commands |
-| `ARENA_MATCH_ADMIN_PUBLIC_KEY` | unset | Optional raw Ed25519 public key, unpadded base64url, for administrator commands |
-| `ARENA_WS_CHANNEL_CAPACITY` | `32` | Maximum pending events per WebSocket connection |
-| `ARENA_WS_HEARTBEAT_SECONDS` | `15` | Interval between server ping frames |
-| `ARENA_WS_CLIENT_TIMEOUT_SECONDS` | `45` | Maximum time without client traffic before disconnect |
-
-PowerShell example:
-
-```powershell
-$env:ARENA_PORT = "8080"
-$env:RUST_LOG = "arena_core=debug"
-cargo run
-```
-
-The included `.env.example` documents these values. The service intentionally does not load `.env` automatically, which keeps configuration behavior explicit across local and production environments.
-
-## Deploy with Docker Compose
-
-Build and start the API with PostgreSQL:
+Install Docker Desktop, open a terminal in this folder, and run:
 
 ```bash
 docker compose up --build -d
-docker compose ps
 ```
 
-The Compose stack exposes the API on `127.0.0.1:3000` and PostgreSQL on `127.0.0.1:55432`. The non-default host database port avoids collisions with an existing PostgreSQL installation. Compose waits for the database health check before starting ArenaCore. The application embeds and applies SQLx migrations during startup, and `/ready` stays unavailable when PostgreSQL cannot answer a probe.
+This starts the API and PostgreSQL. The API is at `http://127.0.0.1:3000`; PostgreSQL is available on port `55432` on your computer. ArenaCore applies its database updates automatically when it starts.
 
-Check the deployed services:
+Check that it is running:
 
 ```bash
 curl http://127.0.0.1:3000/health
 curl http://127.0.0.1:3000/ready
-curl http://127.0.0.1:3000/metrics
 ```
 
-Stop the stack while retaining PostgreSQL data:
+The first address checks that the API is running. The second checks that it can reach its database. To stop the services while keeping the saved database data, run:
 
 ```bash
 docker compose down
 ```
 
-For a host-run API with only PostgreSQL in Docker, start `docker compose up -d postgres`, set `ARENA_STORAGE=postgres` and `ARENA_DATABASE_URL=postgresql://arena:arena@127.0.0.1:55432/arenacore`, then run `cargo run`.
+For local experiments that let players submit their own match results, enable the development option before starting Compose. Keep this option off for a public or production server:
 
-## API examples
-
-Check health:
-
-```bash
-curl http://127.0.0.1:3000/health
+```powershell
+$env:ARENA_MATCH_ALLOW_DEV_PARTICIPANTS = "true"
+docker compose up --build -d
 ```
 
-Create a development player:
+Compose reads that setting from your environment. The default is `false`.
+
+### Option 2: Run with Rust
+
+Install a stable Rust toolchain, then run:
+
+```bash
+cargo run
+```
+
+The API listens on `http://127.0.0.1:3000`. This quick-start uses temporary in-memory storage: its data is cleared when the server stops. To use PostgreSQL, first start it with `docker compose up -d postgres`, then set the database settings before running ArenaCore. In PowerShell:
+
+```powershell
+$env:ARENA_STORAGE = "postgres"
+$env:ARENA_DATABASE_URL = "postgresql://arena:arena@127.0.0.1:55432/arenacore"
+cargo run
+```
+
+## How a match works
+
+```mermaid
+flowchart LR
+    A[Create players] --> B[Join a lobby or matchmaking queue]
+    B --> C[Balanced match is created]
+    C --> D[Match starts]
+    D --> E[Match completes]
+    E --> F[Ratings and result are saved]
+    C --> G[Match is cancelled]
+    D --> G
+```
+
+The API is organized around a few main actions:
+
+| What you want to do | Example endpoint |
+| --- | --- |
+| Create a player | `POST /api/v1/players` |
+| Create or join a lobby | `POST /api/v1/lobbies` and `POST /api/v1/lobbies/{id}/join` |
+| Find a match | `POST /api/v1/matchmaking/enqueue` |
+| Check a player's queue or match | `GET /api/v1/matchmaking/status/{player_id}` |
+| Read a match | `GET /api/v1/matches/{match_id}` |
+| Start, complete, or cancel a match | `POST /api/v1/matches/{match_id}/start`, `/complete`, or `/cancel` |
+
+The API uses JSON. For example, create a player with:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/api/v1/players \
@@ -95,193 +98,55 @@ curl -X POST http://127.0.0.1:3000/api/v1/players \
   -d '{"display_name":"Ada","rating":1200}'
 ```
 
-Read a player, replacing the UUID with the `id` returned by the create request:
-
-```bash
-curl http://127.0.0.1:3000/api/v1/players/00000000-0000-0000-0000-000000000000
-```
-
-`display_name` is trimmed and must contain 3 to 24 Unicode characters. `rating` is optional, defaults to `1200`, and must be between `0` and `3000` inclusive.
-
-Create a lobby, replacing `owner_player_id` with an existing player UUID:
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/v1/lobbies \
-  -H "Content-Type: application/json" \
-  -d '{"owner_player_id":"00000000-0000-0000-0000-000000000000","capacity":4}'
-```
-
-Join a lobby:
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/v1/lobbies/00000000-0000-0000-0000-000000000000/join \
-  -H "Content-Type: application/json" \
-  -d '{"player_id":"00000000-0000-0000-0000-000000000000"}'
-```
-
-Set a member's ready state:
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/v1/lobbies/00000000-0000-0000-0000-000000000000/ready \
-  -H "Content-Type: application/json" \
-  -d '{"player_id":"00000000-0000-0000-0000-000000000000","ready":true}'
-```
-
-Leave a lobby by posting the same `player_id` to `/api/v1/lobbies/{lobby_id}/leave`. Read current state with `GET /api/v1/lobbies/{lobby_id}`.
-
-Lobby capacity defaults to `4` and must be between `2` and `8`. The owner is the first member. Repeating a join for the same lobby is idempotent; a player cannot belong to two lobbies. If the owner leaves, ownership transfers to the longest-tenured remaining member. A lobby becomes `ready` when it has at least two members and every member is ready, returns to `open` when that condition stops being true, and becomes `closed` when its last member leaves.
-
-Enqueue an existing player for a 1v1 match:
+The response includes the new player's `id`. Use that ID in later requests. To queue the player for a 1v1 match, send:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/api/v1/matchmaking/enqueue \
   -H "Content-Type: application/json" \
-  -d '{"player_id":"00000000-0000-0000-0000-000000000000","mode":"1v1"}'
+  -d '{"player_id":"<PLAYER_ID>","mode":"1v1"}'
 ```
 
-Use `"2v2"` for four-player matchmaking. Check the player's current queue or match assignment:
+Use `"2v2"` to make a four-player match. When enough compatible players are queued, ArenaCore creates the match and assigns teams. Check the player's status to get its match ID.
 
-```bash
-curl http://127.0.0.1:3000/api/v1/matchmaking/status/00000000-0000-0000-0000-000000000000
-```
+## Who can report match results?
 
-Cancel queue membership. Cancellation is idempotent and returns `204 No Content`:
+Match commands require a bearer token. By default, players cannot submit match results themselves.
 
-```bash
-curl -X DELETE http://127.0.0.1:3000/api/v1/matchmaking/queue/00000000-0000-0000-0000-000000000000
-```
+For local development only, set `ARENA_MATCH_ALLOW_DEV_PARTICIPANTS=true` before starting the service. A participant can then use a short-lived development session token from `POST /api/v1/dev/sessions` to start or complete their match. The same option lets a participant cancel a match.
 
-When status becomes `matched`, read the match and its assignment-time rating snapshot:
+For a real deployment, keep that option off and configure an Ed25519 public key for the game server. The game server uses its private key to create short-lived credentials scoped to one match and one action. It can start and complete matches. A separate administrator key can also authorize cancellation. Private keys stay with the trusted game server or administrator; ArenaCore only receives the public keys.
 
-```bash
-curl http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000
-```
+See the [match authority guide](docs/match-authority.md) for the credential format and [game client contract](docs/game-client-contract.md) for request details and Unity, Unreal, and Godot examples.
 
-For local participant-driven lifecycle testing, set `ARENA_MATCH_ALLOW_DEV_PARTICIPANTS=true` before starting the server and issue a development session token for one of the match participants:
+## Live updates
 
-```bash
-MATCH_TOKEN=$(curl -s -X POST http://127.0.0.1:3000/api/v1/dev/sessions \
-  -H "Content-Type: application/json" \
-  -d '{"player_id":"00000000-0000-0000-0000-000000000000"}' | jq -r '.access_token')
-```
+Game clients can connect to ArenaCore's WebSocket endpoint to receive events such as `match_found`, `match_started`, and `match_completed`. Clients should read the HTTP resource after reconnecting because these live events are not saved for later replay.
 
-Start the match with that participant's token:
+## Configuration
 
-```bash
-curl -X POST http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000/start \
-  -H "Authorization: Bearer $MATCH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"player_id":"00000000-0000-0000-0000-000000000000"}'
-```
+The server reads configuration from environment variables. The main settings are:
 
-Complete an active match and award Elo changes atomically. `winning_team` is `a` or `b`:
+| Setting | Default | What it controls |
+| --- | --- | --- |
+| `ARENA_HOST` / `ARENA_PORT` | `127.0.0.1` / `3000` | API address |
+| `ARENA_STORAGE` | `memory` | `memory` for temporary local data, or `postgres` for saved database data |
+| `ARENA_DATABASE_URL` | unset | PostgreSQL connection string when database mode is enabled |
+| `ARENA_MATCH_ALLOW_DEV_PARTICIPANTS` | `false` | Whether participants may submit match commands with development sessions |
+| `ARENA_MATCH_GAME_SERVER_PUBLIC_KEY` | unset | Game-server Ed25519 public key in unpadded base64url format |
+| `ARENA_MATCH_ADMIN_PUBLIC_KEY` | unset | Optional administrator Ed25519 public key in unpadded base64url format |
+| `ARENA_RATING_K_FACTOR` | `32` | How strongly a match result changes player ratings |
 
-```bash
-curl -X POST http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000/complete \
-  -H "Authorization: Bearer $MATCH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"player_id":"00000000-0000-0000-0000-000000000000","winning_team":"a"}'
-```
+See [.env.example](.env.example) for all available settings. When running the Rust program directly, set variables in your shell; the program does not automatically load a `.env` file. Docker Compose reads a `.env` file for the match-authority settings it passes into the container.
 
-To abandon a `ready` or `active` match without changing ratings, post the participant's `player_id` to `/api/v1/matches/{match_id}/cancel` with the same bearer header. Start, same-result completion, and cancellation commands are idempotent. Completing with a different winner after a result exists returns `409 Conflict`.
+## Useful project guides
 
-Participant commands are disabled by default. In production, configure an Ed25519 public key for the game server and optionally a different key for administrators; send a short-lived, command-scoped signed bearer token and omit `player_id` from the request. Game servers can start and complete matches. Administrators can start, complete, or cancel them. See the [match authority contract](docs/match-authority.md) for credential construction and key handling.
+- [Match authority guide](docs/match-authority.md) — permissions, keys, and signed match commands.
+- [Game client contract](docs/game-client-contract.md) — API payloads, reconnect behavior, and engine examples.
+- [Load testing guide](docs/load-testing.md) — repeatable performance scenarios and profiling.
 
-Each player can have only one active activity: lobby membership, queue membership, or a match assignment. Duplicate queue requests and conflicting lobby operations return `409 Conflict` with machine-readable codes.
+## For contributors
 
-### Matchmaking policy
-
-The 1v1 and 2v2 queues are independent. The matcher considers players in enqueue order, selects the oldest feasible anchor, and prefers the closest ratings. Two players are compatible when their rating difference fits the larger of their current wait-adjusted windows. This lets a long-waiting player gradually accept a wider skill range without immediately degrading match quality for new arrivals.
-
-For 2v2, the matcher first selects four mutually compatible players with the smallest rating spread. It then enumerates the three unique two-team partitions and minimizes the absolute difference between team rating totals. UUID ordering provides deterministic tie-breaks. A one-second background tick reevaluates queues so waiting players can match after their rating windows expand even when no new enqueue request arrives.
-
-Matches transition from `ready` to `active`, then to `completed`; a `ready` or `active` match can instead become `cancelled`. Completion uses the team-average Elo expectation and the configured K-factor, persists every player's before/after rating and delta, and releases all participants for their next activity in the same transaction. Cancellation also releases participants but does not alter ratings. Match history records whether a lifecycle transition was submitted by a development player, game server, or administrator.
-
-### Real-time notifications
-
-Issue a development access token for an existing player:
-
-```bash
-curl -X POST http://127.0.0.1:3000/api/v1/dev/sessions \
-  -H "Content-Type: application/json" \
-  -d '{"player_id":"00000000-0000-0000-0000-000000000000"}'
-```
-
-Connect to `ws://127.0.0.1:3000/api/v1/ws?player_id={player_id}` with the response token in an `Authorization: Bearer {access_token}` header. A token is bound to exactly one player, so changing `player_id` cannot subscribe to another player's events. The session endpoint and its in-memory bearer tokens are development scaffolding; production deployments should replace them with the platform identity provider and short-lived signed credentials.
-
-The server sends JSON text frames with a stable envelope:
-
-```json
-{
-  "type": "match_found",
-  "event_id": "00000000-0000-0000-0000-000000000000",
-  "occurred_at": "2026-11-19T12:00:00Z",
-  "payload": {}
-}
-```
-
-Current event types are `lobby_updated`, `queue_updated`, `match_found`, `match_started`, `match_completed`, and `match_cancelled`. Lobby membership and ready-state changes notify all affected members. Match and matchmaking events are emitted from the service layer for both HTTP-triggered and background changes. Lifecycle event payloads carry match state, teams, the winner when present, and persisted rating changes.
-
-Each connection has its own bounded event channel. A connection that cannot consume events before its channel fills is removed instead of allowing unbounded memory growth. The server sends ping frames at the configured heartbeat interval, treats pong or other client traffic as liveness, and unregisters the subscription on close, transport failure, timeout, or backpressure removal. Clients should reconnect and fetch current HTTP state after any disconnect because notification delivery is intentionally ephemeral.
-
-### Operations
-
-`GET /health` is a process-liveness check. `GET /ready` verifies the configured storage backend and returns `503 Service Unavailable` if PostgreSQL is unreachable. `GET /metrics` returns Prometheus text metrics for request counts, 4xx/5xx responses, rate-limit rejections, aggregate request duration, and active WebSocket connections.
-
-Rate limiting applies to `/api/v1` routes and uses the connection peer IP when the server is running normally. Operational endpoints remain available to orchestrators and monitoring systems. Rejected requests return `429 Too Many Requests`, a `Retry-After` header, and the standard `rate_limited` error envelope. The built-in limiter is intentionally process-local; a multi-replica deployment should enforce a shared limit at the gateway or use a distributed store.
-
-Errors use a stable envelope:
-
-```json
-{
-  "error": {
-    "code": "player_not_found",
-    "message": "player was not found"
-  }
-}
-```
-
-## Architecture
-
-- `api` owns HTTP handlers, request/response DTOs, and transport error mapping.
-- `domain` owns players, lobbies, queues, match lifecycle, Elo calculation, matching policy, and state invariants, independent of Axum.
-- `service` owns validation, player/lobby/matchmaking/lifecycle use cases, scoped match-credential verification, development sessions, and notification fan-out.
-- `storage` defines repository boundaries plus in-memory and SQLx PostgreSQL implementations.
-- `operations` owns request metrics and the bounded per-client rate limiter.
-- `app` wires routes to application state, while `main` handles process concerns such as configuration, tracing, listening, and shutdown.
-
-The in-memory repositories use standard-library `RwLock` values. Their critical sections contain only short state transitions and never cross an `.await`. A shared player-activity registry atomically prevents lobby, queue, and match membership from overlapping.
-
-The PostgreSQL implementation stores players, lobbies, memberships, queue entries, match snapshots, match players, results, per-player rating changes, active-player ownership, and append-only match history. Result rows record whether a development player, game server, or administrator submitted the result; lifecycle history records the same authority. Lobby mutations lock the affected rows and commit membership, owner, status, and activity changes in one transaction. Matchmaking uses one PostgreSQL advisory transaction lock to serialize queue selection across API and background workers; this favors correctness and simple recovery over maximum matching throughput. Match creation, queue removal, player activity updates, and the first history entry commit atomically. Match completion locks the match and player rows, then commits its result, ratings, history, and activity release together so concurrent duplicate submissions cannot apply Elo twice.
-
-Memory mode remains the default for fast development and database-free tests. Development bearer sessions and live WebSocket delivery are process-local in both modes.
-
-## Game integration and load testing
-
-The engine-neutral client contract documents the exact HTTP payloads, player-bound WebSocket handshake, reconnect behavior, retry rules, and current boundary between matchmaking and gameplay. Small reference clients show the same request flow with Unity `UnityWebRequest`, Unreal `FHttpModule`, and Godot `HTTPRequest`:
-
-- [Game client contract](docs/game-client-contract.md)
-- [Unity example](examples/clients/unity/ArenaCoreClient.cs)
-- [Unreal example](examples/clients/unreal/ArenaCoreClient.cpp)
-- [Godot example](examples/clients/godot/arena_core_client.gd)
-
-Run the four-player correctness scenario against a healthy deployment:
-
-```bash
-cargo run --release --bin arena-load -- \
-  --scenario load/scenarios/smoke.json \
-  --output target/load-reports/smoke.json
-```
-
-The harness supports health throughput and deterministic 1v1 or 2v2 workloads. Reports include operation-level latency percentiles, HTTP throughput, failure counts, assignments, matches, WebSocket handshakes, and `match_found` delivery. For intentional high-volume runs, start Compose with the load override:
-
-```bash
-docker compose -f compose.yaml -f compose.load.yaml up --build -d
-```
-
-See [load testing and profiling](docs/load-testing.md) for the scenario schema, reproducible benchmark procedure, report interpretation, symbol-rich profiling build, and database investigation workflow.
-
-## Checks and tests
+Run the formatting, lint, and test checks with:
 
 ```bash
 cargo fmt --check
@@ -289,14 +154,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The default suite exercises health/readiness, metrics, rate limits, player behavior, validation, concurrent creation and joins, lobby lifecycle rules, cross-activity conflicts, duplicate queue defense, idempotent cancellation, 1v1 assignment, wait-based gap expansion, deterministic 2v2 balancing, match lifecycle transitions, Elo calculation, concurrent duplicate completion, activity release, status reads, match reads, token/player binding, WebSocket lifecycle events, heartbeat handling, bounded-channel backpressure, disconnect cleanup, load-scenario validation, deterministic simulated ratings, and latency percentile calculations.
+Most contributors can use `cargo test` without extra setup. The optional PostgreSQL integration test clears its tables, so only run it with `ARENA_TEST_DATABASE_URL` pointed at a dedicated, disposable database.
 
-The PostgreSQL integration test is opt-in so the normal suite remains database-free:
-
-```bash
-docker compose up -d postgres
-ARENA_TEST_DATABASE_URL=postgresql://arena:arena@127.0.0.1:55432/arenacore cargo test --test postgres
-```
-
-The database test applies migrations, clears only the configured test database, stresses concurrent joins, verifies cross-activity conflicts, forms and completes a match, proves idempotent rating updates, checks result and rating history, and reconnects through a fresh pool. Use a dedicated disposable database URL in CI.
-
+ArenaCore is a Rust modular monolith: the API handles web requests, services coordinate the game's rules, domain code defines players and matches, and storage saves the data. This keeps the first version straightforward to run while leaving room to split services later if the game needs it.
