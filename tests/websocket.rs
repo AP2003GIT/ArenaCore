@@ -3,19 +3,21 @@ use std::{sync::Arc, time::Duration};
 use arena_core::{
     app::{build_app, AppState},
     config::{RateLimitConfig, WebSocketConfig},
-    domain::matchmaking::MatchmakingConfig,
+    domain::{matchmaking::MatchmakingConfig, rating::RatingConfig},
     operations::{OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
+        match_lifecycle_service::MatchLifecycleService,
         matchmaking_service::{MatchmakingService, SystemClock},
         notification_service::NotificationHub,
         player_service::PlayerService,
     },
     storage::{
         activity::PlayerActivityRegistry, lobby_memory::InMemoryLobbyRepository,
+        match_lifecycle_memory::InMemoryMatchLifecycleRepository,
         matchmaking_memory::InMemoryMatchmakingRepository, memory::InMemoryPlayerRepository,
-        readiness::InMemoryReadiness, LobbyRepository, MatchmakingRepository, PlayerRepository,
+        readiness::InMemoryReadiness,
     },
 };
 use axum::{
@@ -48,23 +50,33 @@ struct TestApp {
 
 fn test_app() -> TestApp {
     let activity_registry = Arc::new(PlayerActivityRegistry::new());
-    let player_repository: Arc<dyn PlayerRepository> = Arc::new(InMemoryPlayerRepository::new());
-    let lobby_repository: Arc<dyn LobbyRepository> =
-        Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry)));
-    let matchmaking_repository: Arc<dyn MatchmakingRepository> =
-        Arc::new(InMemoryMatchmakingRepository::new(activity_registry));
-    let notifications = Arc::new(NotificationHub::default());
-    let player_service = PlayerService::new(Arc::clone(&player_repository));
-    let lobby_service = LobbyService::new(
+    let player_repository = Arc::new(InMemoryPlayerRepository::new());
+    let lobby_repository = Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry)));
+    let matchmaking_repository = Arc::new(InMemoryMatchmakingRepository::new(Arc::clone(
+        &activity_registry,
+    )));
+    let match_lifecycle_repository = Arc::new(InMemoryMatchLifecycleRepository::new(
         Arc::clone(&player_repository),
+        Arc::clone(&matchmaking_repository),
+        activity_registry,
+    ));
+    let notifications = Arc::new(NotificationHub::default());
+    let player_service = PlayerService::new(player_repository.clone());
+    let lobby_service = LobbyService::new(
+        player_repository.clone(),
         lobby_repository,
         Arc::clone(&notifications),
     );
     let matchmaking_service = MatchmakingService::new(
-        Arc::clone(&player_repository),
+        player_repository.clone(),
         matchmaking_repository,
         Arc::new(SystemClock),
         MatchmakingConfig::default(),
+        Arc::clone(&notifications),
+    );
+    let match_lifecycle_service = MatchLifecycleService::new(
+        match_lifecycle_repository,
+        RatingConfig::default(),
         Arc::clone(&notifications),
     );
     let dev_session_service = DevSessionService::new(player_repository);
@@ -79,6 +91,7 @@ fn test_app() -> TestApp {
         player_service,
         lobby_service,
         matchmaking_service,
+        match_lifecycle_service,
         dev_session_service,
         notification_hub: Arc::clone(&notifications),
         websocket_config,
@@ -253,6 +266,44 @@ async fn websocket_delivers_matchmaking_events_and_cleans_up_disconnect() {
     assert_eq!(
         match_event["payload"]["match_id"],
         match_status_event["payload"]["match_id"]
+    );
+    let match_id = match_event["payload"]["match_id"].as_str().unwrap();
+
+    let started = test_app
+        .router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/start"),
+            json!({ "player_id": first_player }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let started_event = next_event(&mut socket).await;
+    assert_eq!(started_event["type"], "match_started");
+    assert_eq!(started_event["payload"]["status"], "active");
+
+    let completed = test_app
+        .router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/complete"),
+            json!({ "player_id": second_player, "winning_team": "a" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let completed_event = next_event(&mut socket).await;
+    assert_eq!(completed_event["type"], "match_completed");
+    assert_eq!(completed_event["payload"]["status"], "completed");
+    assert_eq!(
+        completed_event["payload"]["rating_changes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
 
     socket.close(None).await.unwrap();

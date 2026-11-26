@@ -7,13 +7,13 @@ use axum::{
 };
 
 use crate::{
-    api::{error::ApiError, health, lobbies, matchmaking, players, sessions, ws},
+    api::{error::ApiError, health, lobbies, matches, matchmaking, players, sessions, ws},
     config::WebSocketConfig,
     operations::{enforce_rate_limit, observe_requests, OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService, lobby_service::LobbyService,
-        matchmaking_service::MatchmakingService, notification_service::NotificationHub,
-        player_service::PlayerService,
+        match_lifecycle_service::MatchLifecycleService, matchmaking_service::MatchmakingService,
+        notification_service::NotificationHub, player_service::PlayerService,
     },
     storage::readiness::ReadinessProbe,
 };
@@ -23,6 +23,7 @@ pub struct AppState {
     pub player_service: PlayerService,
     pub lobby_service: LobbyService,
     pub matchmaking_service: MatchmakingService,
+    pub match_lifecycle_service: MatchLifecycleService,
     pub dev_session_service: DevSessionService,
     pub notification_hub: Arc<NotificationHub>,
     pub websocket_config: WebSocketConfig,
@@ -53,6 +54,12 @@ pub fn build_app(state: AppState) -> Router {
             get(matchmaking::get_status),
         )
         .route("/api/v1/matches/{match_id}", get(matchmaking::get_match))
+        .route("/api/v1/matches/{match_id}/start", post(matches::start))
+        .route(
+            "/api/v1/matches/{match_id}/complete",
+            post(matches::complete),
+        )
+        .route("/api/v1/matches/{match_id}/cancel", post(matches::cancel))
         .route("/api/v1/dev/sessions", post(sessions::create_dev_session))
         .route("/api/v1/ws", get(ws::connect))
         .layer(middleware::from_fn_with_state(

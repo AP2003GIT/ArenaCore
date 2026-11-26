@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod lobby_memory;
+pub mod match_lifecycle_memory;
 pub mod matchmaking_memory;
 pub mod memory;
 pub mod postgres;
@@ -10,10 +11,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{
-    game_match::GameMatch,
+    game_match::{GameMatch, MatchLifecycleError, MatchTeam},
     lobby::{Lobby, LobbyError},
     matchmaking::{MatchmakingConfig, MatchmakingStateError, PlayerMatchmakingStatus, QueueEntry},
     player::Player,
+    rating::RatingConfig,
 };
 
 #[async_trait]
@@ -58,6 +60,32 @@ pub trait MatchmakingRepository: Send + Sync {
         now_seconds: u64,
         config: MatchmakingConfig,
     ) -> Result<Vec<GameMatch>, MatchmakingRepositoryError>;
+}
+
+#[async_trait]
+pub trait MatchLifecycleRepository: Send + Sync {
+    async fn start_match(
+        &self,
+        match_id: Uuid,
+        requested_by: Uuid,
+    ) -> Result<MatchUpdate, MatchLifecycleRepositoryError>;
+    async fn complete_match(
+        &self,
+        match_id: Uuid,
+        requested_by: Uuid,
+        winning_team: MatchTeam,
+        rating_config: RatingConfig,
+    ) -> Result<MatchUpdate, MatchLifecycleRepositoryError>;
+    async fn cancel_match(
+        &self,
+        match_id: Uuid,
+        requested_by: Uuid,
+    ) -> Result<MatchUpdate, MatchLifecycleRepositoryError>;
+}
+
+pub struct MatchUpdate {
+    pub game_match: GameMatch,
+    pub changed: bool,
 }
 
 pub struct EnqueueResult {
@@ -115,4 +143,20 @@ pub enum MatchmakingRepositoryError {
     InvalidStoredState,
     #[error(transparent)]
     State(#[from] MatchmakingStateError),
+}
+
+#[derive(Debug, Error)]
+pub enum MatchLifecycleRepositoryError {
+    #[error("match was not found")]
+    MatchNotFound,
+    #[error("match lifecycle state is inconsistent")]
+    InconsistentState,
+    #[error("match lifecycle lock is unavailable")]
+    Unavailable,
+    #[error("database operation failed")]
+    Database(#[source] sqlx::Error),
+    #[error("database contained an invalid match lifecycle state")]
+    InvalidStoredState,
+    #[error(transparent)]
+    Domain(#[from] MatchLifecycleError),
 }

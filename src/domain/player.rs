@@ -35,4 +35,8 @@ impl Player {
     pub fn rating(&self) -> u16 {
         self.rating
     }
+
+    pub(crate) fn set_rating(&mut self, rating: u16) {
+        self.rating = rating;
+    }
 }

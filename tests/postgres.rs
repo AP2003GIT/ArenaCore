@@ -2,14 +2,16 @@ use std::{sync::Arc, time::Duration};
 
 use arena_core::{
     domain::{
-        game_match::MatchMode,
+        game_match::{MatchMode, MatchStatus, MatchTeam},
         lobby::{Lobby, LobbyStatus},
         matchmaking::{MatchmakingConfig, PlayerMatchmakingStatus, QueueEntry},
         player::Player,
+        rating::RatingConfig,
     },
     storage::{
-        postgres::PostgresRepository, LobbyRepository, LobbyRepositoryError, MatchmakingRepository,
-        MatchmakingRepositoryError, PlayerRepository,
+        postgres::PostgresRepository, LobbyRepository, LobbyRepositoryError,
+        MatchLifecycleRepository, MatchmakingRepository, MatchmakingRepositoryError,
+        PlayerRepository,
     },
 };
 use tokio::task::JoinSet;
@@ -26,7 +28,7 @@ async fn postgres_repositories_preserve_invariants_and_history() {
             .unwrap(),
     );
     sqlx::query(
-        "TRUNCATE match_history, match_players, matches, matchmaking_queue, lobby_memberships, lobbies, player_activities, players RESTART IDENTITY CASCADE",
+        "TRUNCATE match_rating_changes, match_results, match_history, match_players, matches, matchmaking_queue, lobby_memberships, lobbies, player_activities, players RESTART IDENTITY CASCADE",
     )
     .execute(repository.pool())
     .await
@@ -125,6 +127,33 @@ async fn postgres_repositories_preserve_invariants_and_history() {
         .unwrap()
         .unwrap();
     assert_eq!(stored_match, *formed_match);
+    let started =
+        MatchLifecycleRepository::start_match(&*repository, formed_match.id(), first.id())
+            .await
+            .unwrap();
+    assert!(started.changed);
+    assert_eq!(started.game_match.status(), MatchStatus::Active);
+    let completed = MatchLifecycleRepository::complete_match(
+        &*repository,
+        formed_match.id(),
+        second.id(),
+        MatchTeam::A,
+        RatingConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(completed.changed);
+    assert_eq!(completed.game_match.status(), MatchStatus::Completed);
+    let repeated = MatchLifecycleRepository::complete_match(
+        &*repository,
+        formed_match.id(),
+        first.id(),
+        MatchTeam::A,
+        RatingConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!repeated.changed);
 
     let history_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM match_history WHERE match_id = $1")
@@ -132,7 +161,14 @@ async fn postgres_repositories_preserve_invariants_and_history() {
             .fetch_one(repository.pool())
             .await
             .unwrap();
-    assert_eq!(history_count, 1);
+    assert_eq!(history_count, 3);
+    let rating_history_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM match_rating_changes WHERE match_id = $1")
+            .bind(formed_match.id())
+            .fetch_one(repository.pool())
+            .await
+            .unwrap();
+    assert_eq!(rating_history_count, 2);
 
     let reconnected = PostgresRepository::connect(&database_url, 2, Duration::from_secs(5))
         .await
@@ -141,12 +177,25 @@ async fn postgres_repositories_preserve_invariants_and_history() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(restored_player, first);
+    let first_change = completed
+        .game_match
+        .result()
+        .unwrap()
+        .rating_changes()
+        .iter()
+        .find(|change| change.player_id() == first.id())
+        .unwrap();
+    assert_eq!(restored_player.rating(), first_change.rating_after());
+    let restored_match = MatchmakingRepository::find_match(&reconnected, formed_match.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_match, completed.game_match);
     assert!(matches!(
         MatchmakingRepository::status(&reconnected, first.id())
             .await
             .unwrap(),
-        PlayerMatchmakingStatus::Matched { .. }
+        PlayerMatchmakingStatus::Idle
     ));
 }
 

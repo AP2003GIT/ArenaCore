@@ -7,13 +7,17 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        game_match::{GameMatch, MatchMode, MatchPlayer, MatchStatus},
+        game_match::{
+            GameMatch, MatchMode, MatchPlayer, MatchResult, MatchStatus, MatchTeam, RatingChange,
+        },
         lobby::{Lobby, LobbyError, LobbyMember, LobbyStatus},
         matchmaking::{MatchmakingConfig, MatchmakingState, PlayerMatchmakingStatus, QueueEntry},
         player::Player,
+        rating::{calculate_match_result, RatingConfig},
     },
     storage::{
-        EnqueueResult, LobbyRepository, LobbyRepositoryError, MatchmakingRepository,
+        EnqueueResult, LobbyRepository, LobbyRepositoryError, MatchLifecycleRepository,
+        MatchLifecycleRepositoryError, MatchUpdate, MatchmakingRepository,
         MatchmakingRepositoryError, PlayerRepository, RepositoryError,
     },
 };
@@ -188,13 +192,18 @@ impl PostgresRepository {
     async fn fetch_match(
         connection: &mut PgConnection,
         match_id: Uuid,
+        for_update: bool,
     ) -> Result<Option<GameMatch>, MatchmakingRepositoryError> {
-        let Some(row) =
-            sqlx::query_as::<_, MatchRow>("SELECT id, mode, status FROM matches WHERE id = $1")
-                .bind(match_id)
-                .fetch_optional(&mut *connection)
-                .await
-                .map_err(MatchmakingRepositoryError::Database)?
+        let sql = if for_update {
+            "SELECT id, mode, status FROM matches WHERE id = $1 FOR UPDATE"
+        } else {
+            "SELECT id, mode, status FROM matches WHERE id = $1"
+        };
+        let Some(row) = sqlx::query_as::<_, MatchRow>(sql)
+            .bind(match_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(MatchmakingRepositoryError::Database)?
         else {
             return Ok(None);
         };
@@ -221,8 +230,41 @@ impl PostgresRepository {
                 _ => return Err(MatchmakingRepositoryError::InvalidStoredState),
             }
         }
+        let result_row = sqlx::query_as::<_, MatchResultRow>(
+            "SELECT winning_team FROM match_results WHERE match_id = $1",
+        )
+        .bind(match_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(MatchmakingRepositoryError::Database)?;
+        let result = if let Some(result_row) = result_row {
+            let winning_team = MatchTeam::parse_number(result_row.winning_team)
+                .ok_or(MatchmakingRepositoryError::InvalidStoredState)?;
+            let rows = sqlx::query_as::<_, RatingChangeRow>(
+                "SELECT player_id, rating_before, rating_after, rating_delta FROM match_rating_changes WHERE match_id = $1 ORDER BY player_id",
+            )
+            .bind(match_id)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(MatchmakingRepositoryError::Database)?;
+            let mut changes = Vec::with_capacity(rows.len());
+            for row in rows {
+                let rating_before = u16::try_from(row.rating_before)
+                    .map_err(|_| MatchmakingRepositoryError::InvalidStoredState)?;
+                let rating_after = u16::try_from(row.rating_after)
+                    .map_err(|_| MatchmakingRepositoryError::InvalidStoredState)?;
+                let change = RatingChange::new(row.player_id, rating_before, rating_after);
+                if change.delta() != row.rating_delta {
+                    return Err(MatchmakingRepositoryError::InvalidStoredState);
+                }
+                changes.push(change);
+            }
+            Some(MatchResult::new(winning_team, changes))
+        } else {
+            None
+        };
         Ok(Some(GameMatch::restore(
-            row.id, mode, status, team_a, team_b,
+            row.id, mode, status, team_a, team_b, result,
         )))
     }
 }
@@ -564,7 +606,7 @@ impl MatchmakingRepository for PostgresRepository {
             .acquire()
             .await
             .map_err(MatchmakingRepositoryError::Database)?;
-        Self::fetch_match(&mut connection, match_id).await
+        Self::fetch_match(&mut connection, match_id, false).await
     }
 
     async fn run_pending(
@@ -587,6 +629,257 @@ impl MatchmakingRepository for PostgresRepository {
             .map_err(MatchmakingRepositoryError::Database)?;
         Ok(matches)
     }
+}
+
+#[async_trait]
+impl MatchLifecycleRepository for PostgresRepository {
+    async fn start_match(
+        &self,
+        match_id: Uuid,
+        requested_by: Uuid,
+    ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+        let mut game_match = Self::fetch_match(&mut transaction, match_id, true)
+            .await
+            .map_err(map_match_read_error)?
+            .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
+        let previous_status = game_match.status();
+        let changed = game_match.start(requested_by)?;
+        if changed {
+            sqlx::query(
+                "UPDATE matches SET status = $2, started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1",
+            )
+            .bind(match_id)
+            .bind(game_match.status().as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+            append_match_history(
+                &mut transaction,
+                match_id,
+                previous_status,
+                game_match.status(),
+                serde_json::json!({ "requested_by_player_id": requested_by }),
+            )
+            .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+        Ok(MatchUpdate {
+            game_match,
+            changed,
+        })
+    }
+
+    async fn complete_match(
+        &self,
+        match_id: Uuid,
+        requested_by: Uuid,
+        winning_team: MatchTeam,
+        rating_config: RatingConfig,
+    ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+        let mut game_match = Self::fetch_match(&mut transaction, match_id, true)
+            .await
+            .map_err(map_match_read_error)?
+            .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
+        let previous_status = game_match.status();
+        let result = calculate_match_result(&game_match, winning_team, rating_config);
+        let changed = game_match.complete(requested_by, result)?;
+        if !changed {
+            transaction
+                .commit()
+                .await
+                .map_err(MatchLifecycleRepositoryError::Database)?;
+            return Ok(MatchUpdate {
+                game_match,
+                changed: false,
+            });
+        }
+
+        let result = game_match
+            .result()
+            .expect("a completed match always contains a result");
+        for change in result.rating_changes() {
+            let current_rating: Option<i16> =
+                sqlx::query_scalar("SELECT rating FROM players WHERE id = $1 FOR UPDATE")
+                    .bind(change.player_id())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(MatchLifecycleRepositoryError::Database)?;
+            if current_rating != Some(to_db_rating(change.rating_before())) {
+                return Err(MatchLifecycleRepositoryError::InconsistentState);
+            }
+        }
+        for change in result.rating_changes() {
+            sqlx::query("UPDATE players SET rating = $2, updated_at = NOW() WHERE id = $1")
+                .bind(change.player_id())
+                .bind(to_db_rating(change.rating_after()))
+                .execute(&mut *transaction)
+                .await
+                .map_err(MatchLifecycleRepositoryError::Database)?;
+        }
+        sqlx::query(
+            "INSERT INTO match_results (match_id, winning_team, submitted_by_player_id) VALUES ($1, $2, $3)",
+        )
+        .bind(match_id)
+        .bind(winning_team.number())
+        .bind(requested_by)
+        .execute(&mut *transaction)
+        .await
+        .map_err(MatchLifecycleRepositoryError::Database)?;
+        for change in result.rating_changes() {
+            sqlx::query(
+                "INSERT INTO match_rating_changes (match_id, player_id, rating_before, rating_after, rating_delta) VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(match_id)
+            .bind(change.player_id())
+            .bind(to_db_rating(change.rating_before()))
+            .bind(to_db_rating(change.rating_after()))
+            .bind(change.delta())
+            .execute(&mut *transaction)
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+        }
+        sqlx::query(
+            "UPDATE matches SET status = $2, finished_at = NOW(), updated_at = NOW() WHERE id = $1",
+        )
+        .bind(match_id)
+        .bind(game_match.status().as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(MatchLifecycleRepositoryError::Database)?;
+        release_match_activities(&mut transaction, &game_match).await?;
+        append_match_history(
+            &mut transaction,
+            match_id,
+            previous_status,
+            game_match.status(),
+            serde_json::json!({
+                "requested_by_player_id": requested_by,
+                "winning_team": winning_team.as_str(),
+            }),
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+
+        Ok(MatchUpdate {
+            game_match,
+            changed: true,
+        })
+    }
+
+    async fn cancel_match(
+        &self,
+        match_id: Uuid,
+        requested_by: Uuid,
+    ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+        let mut game_match = Self::fetch_match(&mut transaction, match_id, true)
+            .await
+            .map_err(map_match_read_error)?
+            .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
+        let previous_status = game_match.status();
+        let changed = game_match.cancel(requested_by)?;
+        if changed {
+            sqlx::query(
+                "UPDATE matches SET status = $2, finished_at = NOW(), updated_at = NOW() WHERE id = $1",
+            )
+            .bind(match_id)
+            .bind(game_match.status().as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+            release_match_activities(&mut transaction, &game_match).await?;
+            append_match_history(
+                &mut transaction,
+                match_id,
+                previous_status,
+                game_match.status(),
+                serde_json::json!({ "requested_by_player_id": requested_by }),
+            )
+            .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(MatchLifecycleRepositoryError::Database)?;
+
+        Ok(MatchUpdate {
+            game_match,
+            changed,
+        })
+    }
+}
+
+async fn release_match_activities(
+    transaction: &mut Transaction<'_, Postgres>,
+    game_match: &GameMatch,
+) -> Result<(), MatchLifecycleRepositoryError> {
+    let removed = sqlx::query(
+        "DELETE FROM player_activities WHERE activity_type = 'match' AND activity_id = $1",
+    )
+    .bind(game_match.id())
+    .execute(&mut **transaction)
+    .await
+    .map_err(MatchLifecycleRepositoryError::Database)?;
+    if removed.rows_affected() != game_match.mode().required_players() as u64 {
+        return Err(MatchLifecycleRepositoryError::InconsistentState);
+    }
+    Ok(())
+}
+
+async fn append_match_history(
+    transaction: &mut Transaction<'_, Postgres>,
+    match_id: Uuid,
+    from_status: MatchStatus,
+    to_status: MatchStatus,
+    metadata: serde_json::Value,
+) -> Result<(), MatchLifecycleRepositoryError> {
+    sqlx::query(
+        "INSERT INTO match_history (match_id, from_status, to_status, metadata) VALUES ($1, $2, $3, $4::jsonb)",
+    )
+    .bind(match_id)
+    .bind(from_status.as_str())
+    .bind(to_status.as_str())
+    .bind(metadata.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(MatchLifecycleRepositoryError::Database)?;
+    Ok(())
+}
+
+fn map_match_read_error(error: MatchmakingRepositoryError) -> MatchLifecycleRepositoryError {
+    match error {
+        MatchmakingRepositoryError::Database(source) => {
+            MatchLifecycleRepositoryError::Database(source)
+        }
+        MatchmakingRepositoryError::InvalidStoredState => {
+            MatchLifecycleRepositoryError::InvalidStoredState
+        }
+        _ => MatchLifecycleRepositoryError::InconsistentState,
+    }
+}
+
+fn to_db_rating(rating: u16) -> i16 {
+    i16::try_from(rating).expect("valid player rating fits i16")
 }
 
 async fn update_lobby(
@@ -746,6 +1039,19 @@ struct MatchPlayerRow {
     player_id: Uuid,
     team: i16,
     rating: i16,
+}
+
+#[derive(FromRow)]
+struct MatchResultRow {
+    winning_team: i16,
+}
+
+#[derive(FromRow)]
+struct RatingChangeRow {
+    player_id: Uuid,
+    rating_before: i16,
+    rating_after: i16,
+    rating_delta: i16,
 }
 
 #[derive(FromRow)]

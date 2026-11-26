@@ -1,6 +1,6 @@
 # ArenaCore
 
-ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 6 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, authenticated real-time notifications, PostgreSQL persistence, operational safeguards, a deterministic load harness, and game-engine integration contracts.
+ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 7 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, an atomic match lifecycle with Elo rating updates, authenticated real-time notifications, PostgreSQL persistence, operational safeguards, a deterministic load harness, and game-engine integration contracts.
 
 ## Prerequisites
 
@@ -34,6 +34,7 @@ Configuration uses environment variables:
 | `ARENA_MATCH_BASE_GAP` | `100` | Initial allowed rating difference |
 | `ARENA_MATCH_GAP_GROWTH_PER_SECOND` | `10` | Rating points added to the window per second waited |
 | `ARENA_MATCH_MAX_GAP` | `1000` | Maximum allowed rating difference |
+| `ARENA_RATING_K_FACTOR` | `32` | Elo rating sensitivity; must be from 1 through 128 |
 | `ARENA_WS_CHANNEL_CAPACITY` | `32` | Maximum pending events per WebSocket connection |
 | `ARENA_WS_HEARTBEAT_SECONDS` | `15` | Interval between server ping frames |
 | `ARENA_WS_CLIENT_TIMEOUT_SECONDS` | `45` | Maximum time without client traffic before disconnect |
@@ -147,11 +148,29 @@ Cancel queue membership. Cancellation is idempotent and returns `204 No Content`
 curl -X DELETE http://127.0.0.1:3000/api/v1/matchmaking/queue/00000000-0000-0000-0000-000000000000
 ```
 
-When status becomes `matched`, read the immutable match snapshot:
+When status becomes `matched`, read the match and its assignment-time rating snapshot:
 
 ```bash
 curl http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000
 ```
+
+Start the match as one of its participants:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000/start \
+  -H "Content-Type: application/json" \
+  -d '{"player_id":"00000000-0000-0000-0000-000000000000"}'
+```
+
+Complete an active match and award Elo changes atomically. `winning_team` is `a` or `b`:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000/complete \
+  -H "Content-Type: application/json" \
+  -d '{"player_id":"00000000-0000-0000-0000-000000000000","winning_team":"a"}'
+```
+
+To abandon a `ready` or `active` match without changing ratings, post the participant's `player_id` to `/api/v1/matches/{match_id}/cancel`. Start, same-result completion, and cancellation commands are idempotent. Completing with a different winner after a result exists returns `409 Conflict`.
 
 Each player can have only one active activity: lobby membership, queue membership, or a match assignment. Duplicate queue requests and conflicting lobby operations return `409 Conflict` with machine-readable codes.
 
@@ -161,7 +180,7 @@ The 1v1 and 2v2 queues are independent. The matcher considers players in enqueue
 
 For 2v2, the matcher first selects four mutually compatible players with the smallest rating spread. It then enumerates the three unique two-team partitions and minimizes the absolute difference between team rating totals. UUID ordering provides deterministic tie-breaks. A one-second background tick reevaluates queues so waiting players can match after their rating windows expand even when no new enqueue request arrives.
 
-Matches enter `ready` and retain the players' ratings at assignment time. Completion, cancellation after assignment, and rating updates belong to later match-lifecycle work.
+Matches transition from `ready` to `active`, then to `completed`; a `ready` or `active` match can instead become `cancelled`. Completion uses the team-average Elo expectation and the configured K-factor, persists every player's before/after rating and delta, and releases all participants for their next activity in the same transaction. Cancellation also releases participants but does not alter ratings. During development, any match participant may issue lifecycle commands; production authority should move to signed game-server or administrator credentials.
 
 ### Real-time notifications
 
@@ -186,7 +205,7 @@ The server sends JSON text frames with a stable envelope:
 }
 ```
 
-Current event types are `lobby_updated`, `queue_updated`, and `match_found`. Lobby membership and ready-state changes notify all affected members. Matchmaking events are emitted from the service layer for both HTTP-triggered and background matches.
+Current event types are `lobby_updated`, `queue_updated`, `match_found`, `match_started`, `match_completed`, and `match_cancelled`. Lobby membership and ready-state changes notify all affected members. Match and matchmaking events are emitted from the service layer for both HTTP-triggered and background changes. Lifecycle event payloads carry match state, teams, the winner when present, and persisted rating changes.
 
 Each connection has its own bounded event channel. A connection that cannot consume events before its channel fills is removed instead of allowing unbounded memory growth. The server sends ping frames at the configured heartbeat interval, treats pong or other client traffic as liveness, and unregisters the subscription on close, transport failure, timeout, or backpressure removal. Clients should reconnect and fetch current HTTP state after any disconnect because notification delivery is intentionally ephemeral.
 
@@ -210,15 +229,15 @@ Errors use a stable envelope:
 ## Architecture
 
 - `api` owns HTTP handlers, request/response DTOs, and transport error mapping.
-- `domain` owns players, lobbies, queues, match snapshots, matching policy, and state invariants, independent of Axum.
-- `service` owns validation, player/lobby/matchmaking use cases, development sessions, and notification fan-out.
+- `domain` owns players, lobbies, queues, match lifecycle, Elo calculation, matching policy, and state invariants, independent of Axum.
+- `service` owns validation, player/lobby/matchmaking/lifecycle use cases, development sessions, and notification fan-out.
 - `storage` defines repository boundaries plus in-memory and SQLx PostgreSQL implementations.
 - `operations` owns request metrics and the bounded per-client rate limiter.
 - `app` wires routes to application state, while `main` handles process concerns such as configuration, tracing, listening, and shutdown.
 
 The in-memory repositories use standard-library `RwLock` values. Their critical sections contain only short state transitions and never cross an `.await`. A shared player-activity registry atomically prevents lobby, queue, and match membership from overlapping.
 
-The PostgreSQL implementation stores players, lobbies, memberships, queue entries, match snapshots, match players, active-player ownership, and append-only match history. Lobby mutations lock the affected rows and commit membership, owner, status, and activity changes in one transaction. Matchmaking uses one PostgreSQL advisory transaction lock to serialize queue selection across API and background workers; this favors correctness and simple recovery over maximum matching throughput. Match creation, queue removal, player activity updates, and the first history entry commit atomically.
+The PostgreSQL implementation stores players, lobbies, memberships, queue entries, match snapshots, match players, results, per-player rating changes, active-player ownership, and append-only match history. Lobby mutations lock the affected rows and commit membership, owner, status, and activity changes in one transaction. Matchmaking uses one PostgreSQL advisory transaction lock to serialize queue selection across API and background workers; this favors correctness and simple recovery over maximum matching throughput. Match creation, queue removal, player activity updates, and the first history entry commit atomically. Match completion locks the match and player rows, then commits its result, ratings, history, and activity release together so concurrent duplicate submissions cannot apply Elo twice.
 
 Memory mode remains the default for fast development and database-free tests. Development bearer sessions and live WebSocket delivery are process-local in both modes.
 
@@ -255,7 +274,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The default suite exercises health/readiness, metrics, rate limits, player behavior, validation, concurrent creation and joins, lobby lifecycle rules, cross-activity conflicts, duplicate queue defense, idempotent cancellation, 1v1 assignment, wait-based gap expansion, deterministic 2v2 balancing, status reads, match reads, token/player binding, WebSocket event delivery, heartbeat handling, bounded-channel backpressure, disconnect cleanup, load-scenario validation, deterministic simulated ratings, and latency percentile calculations.
+The default suite exercises health/readiness, metrics, rate limits, player behavior, validation, concurrent creation and joins, lobby lifecycle rules, cross-activity conflicts, duplicate queue defense, idempotent cancellation, 1v1 assignment, wait-based gap expansion, deterministic 2v2 balancing, match lifecycle transitions, Elo calculation, concurrent duplicate completion, activity release, status reads, match reads, token/player binding, WebSocket lifecycle events, heartbeat handling, bounded-channel backpressure, disconnect cleanup, load-scenario validation, deterministic simulated ratings, and latency percentile calculations.
 
 The PostgreSQL integration test is opt-in so the normal suite remains database-free:
 
@@ -264,5 +283,5 @@ docker compose up -d postgres
 ARENA_TEST_DATABASE_URL=postgresql://arena:arena@127.0.0.1:55432/arenacore cargo test --test postgres
 ```
 
-The database test applies migrations, clears only the configured test database, stresses concurrent joins, verifies cross-activity conflicts, forms and reloads a match, checks history, and reconnects through a fresh pool. Use a dedicated disposable database URL in CI.
+The database test applies migrations, clears only the configured test database, stresses concurrent joins, verifies cross-activity conflicts, forms and completes a match, proves idempotent rating updates, checks result and rating history, and reconnects through a fresh pool. Use a dedicated disposable database URL in CI.
 

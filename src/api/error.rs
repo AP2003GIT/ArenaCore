@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::service::{
     dev_session_service::DevSessionError, lobby_service::LobbyServiceError,
+    match_lifecycle_service::MatchLifecycleServiceError,
     matchmaking_service::MatchmakingServiceError, player_service::PlayerServiceError,
 };
 
@@ -58,6 +59,14 @@ impl ApiError {
         }
     }
 
+    pub fn invalid_winning_team() -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_winning_team",
+            message: "winning_team must be either a or b",
+        }
+    }
+
     pub fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -71,6 +80,37 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "route_not_found",
             message: "the requested route does not exist",
+        }
+    }
+}
+
+impl From<MatchLifecycleServiceError> for ApiError {
+    fn from(error: MatchLifecycleServiceError) -> Self {
+        match error {
+            MatchLifecycleServiceError::MatchNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "match_not_found",
+                message: "match was not found",
+            },
+            MatchLifecycleServiceError::PlayerNotParticipant => Self {
+                status: StatusCode::FORBIDDEN,
+                code: "player_not_in_match",
+                message: "player is not a participant in this match",
+            },
+            MatchLifecycleServiceError::InvalidTransition => Self {
+                status: StatusCode::CONFLICT,
+                code: "invalid_match_transition",
+                message: "match cannot perform that transition from its current status",
+            },
+            MatchLifecycleServiceError::ResultConflict => Self {
+                status: StatusCode::CONFLICT,
+                code: "match_result_conflict",
+                message: "match was already completed with a different result",
+            },
+            MatchLifecycleServiceError::Repository(source) => {
+                tracing::error!(%source, "match lifecycle repository operation failed");
+                Self::internal()
+            }
         }
     }
 }

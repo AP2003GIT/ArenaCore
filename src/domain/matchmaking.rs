@@ -171,6 +171,15 @@ impl MatchmakingState {
         self.matches.get(&match_id).cloned()
     }
 
+    pub(crate) fn replace_match(&mut self, game_match: GameMatch) {
+        self.matches.insert(game_match.id(), game_match);
+    }
+
+    pub(crate) fn release_match_players(&mut self, match_id: Uuid) {
+        self.player_matches
+            .retain(|_, (assigned_match_id, _)| *assigned_match_id != match_id);
+    }
+
     pub fn form_available_matches(
         &mut self,
         now_seconds: u64,

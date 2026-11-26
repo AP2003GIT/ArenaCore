@@ -73,6 +73,18 @@ impl PlayerEvent {
         )
     }
 
+    pub fn match_started(game_match: &GameMatch) -> Self {
+        Self::new("match_started", match_payload(game_match))
+    }
+
+    pub fn match_completed(game_match: &GameMatch) -> Self {
+        Self::new("match_completed", match_payload(game_match))
+    }
+
+    pub fn match_cancelled(game_match: &GameMatch) -> Self {
+        Self::new("match_cancelled", match_payload(game_match))
+    }
+
     fn new(event_type: &'static str, payload: Value) -> Self {
         let occurred_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -85,6 +97,29 @@ impl PlayerEvent {
             payload,
         }
     }
+}
+
+fn match_payload(game_match: &GameMatch) -> Value {
+    json!({
+        "match_id": game_match.id(),
+        "mode": game_match.mode().as_str(),
+        "status": game_match.status().as_str(),
+        "winning_team": game_match.result().map(|result| result.winning_team().as_str()),
+        "team_a": game_match.team_a().iter().map(|player| json!({
+            "player_id": player.player_id(),
+            "rating": player.rating(),
+        })).collect::<Vec<_>>(),
+        "team_b": game_match.team_b().iter().map(|player| json!({
+            "player_id": player.player_id(),
+            "rating": player.rating(),
+        })).collect::<Vec<_>>(),
+        "rating_changes": game_match.result().map(|result| result.rating_changes().iter().map(|change| json!({
+            "player_id": change.player_id(),
+            "rating_before": change.rating_before(),
+            "rating_after": change.rating_after(),
+            "delta": change.delta(),
+        })).collect::<Vec<_>>()),
+    })
 }
 
 pub struct PlayerSubscription {

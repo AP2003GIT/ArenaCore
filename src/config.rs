@@ -3,6 +3,7 @@ use std::{env, net::SocketAddr, time::Duration};
 use thiserror::Error;
 
 use crate::domain::matchmaking::{MatchmakingConfig, MatchmakingConfigError};
+use crate::domain::rating::{RatingConfig, RatingConfigError};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 3000;
@@ -16,6 +17,7 @@ const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_DB_ACQUIRE_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_RATE_LIMIT_REQUESTS: u32 = 120;
 const DEFAULT_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
+const DEFAULT_RATING_K_FACTOR: u16 = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StorageBackend {
@@ -172,6 +174,7 @@ pub struct Config {
     host: String,
     port: u16,
     matchmaking: MatchmakingConfig,
+    rating: RatingConfig,
     websocket: WebSocketConfig,
     database: DatabaseConfig,
     rate_limit: RateLimitConfig,
@@ -210,6 +213,10 @@ impl Config {
                 DEFAULT_WS_CLIENT_TIMEOUT_SECONDS,
             )?),
         )?;
+        let rating = RatingConfig::new(env_rating_u16(
+            "ARENA_RATING_K_FACTOR",
+            DEFAULT_RATING_K_FACTOR,
+        )?)?;
         let backend = match env::var("ARENA_STORAGE").as_deref() {
             Ok("memory") | Err(_) => StorageBackend::Memory,
             Ok("postgres") => StorageBackend::Postgres,
@@ -244,6 +251,7 @@ impl Config {
             host,
             port,
             matchmaking,
+            rating,
             websocket,
             database,
             rate_limit,
@@ -262,6 +270,10 @@ impl Config {
 
     pub fn websocket_config(&self) -> WebSocketConfig {
         self.websocket
+    }
+
+    pub fn rating_config(&self) -> RatingConfig {
+        self.rating
     }
 
     pub fn database_config(&self) -> &DatabaseConfig {
@@ -287,6 +299,15 @@ fn env_usize(name: &'static str, default: usize) -> Result<usize, ConfigError> {
         Ok(value) => value
             .parse::<usize>()
             .map_err(|_| ConfigError::InvalidWebSocketValue { name, value }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_rating_u16(name: &'static str, default: u16) -> Result<u16, ConfigError> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u16>()
+            .map_err(|_| ConfigError::InvalidRatingValue { name, value }),
         Err(_) => Ok(default),
     }
 }
@@ -336,12 +357,16 @@ pub enum ConfigError {
     InvalidDatabasePool,
     #[error("{name} must be a non-negative integer: {value}")]
     InvalidOperationalValue { name: &'static str, value: String },
+    #[error("{name} must be an integer from 1 to 128: {value}")]
+    InvalidRatingValue { name: &'static str, value: String },
     #[error(transparent)]
     Matchmaking(#[from] MatchmakingConfigError),
     #[error(transparent)]
     WebSocket(#[from] WebSocketConfigError),
     #[error(transparent)]
     RateLimit(#[from] RateLimitConfigError),
+    #[error(transparent)]
+    Rating(#[from] RatingConfigError),
 }
 
 #[cfg(test)]
@@ -354,6 +379,7 @@ mod tests {
             host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
             matchmaking: MatchmakingConfig::default(),
+            rating: RatingConfig::default(),
             websocket: WebSocketConfig::default(),
             database: DatabaseConfig::default(),
             rate_limit: RateLimitConfig::default(),

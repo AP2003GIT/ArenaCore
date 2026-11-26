@@ -3,19 +3,21 @@ use std::{collections::HashSet, sync::Arc};
 use arena_core::{
     app::{build_app, AppState},
     config::{RateLimitConfig, WebSocketConfig},
-    domain::matchmaking::MatchmakingConfig,
+    domain::{matchmaking::MatchmakingConfig, rating::RatingConfig},
     operations::{OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
+        match_lifecycle_service::MatchLifecycleService,
         matchmaking_service::{MatchmakingService, SystemClock},
         notification_service::NotificationHub,
         player_service::PlayerService,
     },
     storage::{
         activity::PlayerActivityRegistry, lobby_memory::InMemoryLobbyRepository,
+        match_lifecycle_memory::InMemoryMatchLifecycleRepository,
         matchmaking_memory::InMemoryMatchmakingRepository, memory::InMemoryPlayerRepository,
-        readiness::InMemoryReadiness, LobbyRepository, MatchmakingRepository, PlayerRepository,
+        readiness::InMemoryReadiness,
     },
 };
 use axum::{
@@ -35,23 +37,33 @@ fn test_app() -> Router {
 
 fn test_app_with_rate_limit(rate_limit_config: RateLimitConfig) -> Router {
     let activity_registry = Arc::new(PlayerActivityRegistry::new());
-    let player_repository: Arc<dyn PlayerRepository> = Arc::new(InMemoryPlayerRepository::new());
-    let lobby_repository: Arc<dyn LobbyRepository> =
-        Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry)));
-    let matchmaking_repository: Arc<dyn MatchmakingRepository> =
-        Arc::new(InMemoryMatchmakingRepository::new(activity_registry));
-    let player_service = PlayerService::new(Arc::clone(&player_repository));
+    let player_repository = Arc::new(InMemoryPlayerRepository::new());
+    let lobby_repository = Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry)));
+    let matchmaking_repository = Arc::new(InMemoryMatchmakingRepository::new(Arc::clone(
+        &activity_registry,
+    )));
+    let match_lifecycle_repository = Arc::new(InMemoryMatchLifecycleRepository::new(
+        Arc::clone(&player_repository),
+        Arc::clone(&matchmaking_repository),
+        activity_registry,
+    ));
+    let player_service = PlayerService::new(player_repository.clone());
     let notification_hub = Arc::new(NotificationHub::default());
     let lobby_service = LobbyService::new(
-        Arc::clone(&player_repository),
+        player_repository.clone(),
         lobby_repository,
         Arc::clone(&notification_hub),
     );
     let matchmaking_service = MatchmakingService::new(
-        Arc::clone(&player_repository),
+        player_repository.clone(),
         matchmaking_repository,
         Arc::new(SystemClock),
         MatchmakingConfig::default(),
+        Arc::clone(&notification_hub),
+    );
+    let match_lifecycle_service = MatchLifecycleService::new(
+        match_lifecycle_repository,
+        RatingConfig::default(),
         Arc::clone(&notification_hub),
     );
     let dev_session_service = DevSessionService::new(player_repository);
@@ -61,6 +73,7 @@ fn test_app_with_rate_limit(rate_limit_config: RateLimitConfig) -> Router {
         player_service,
         lobby_service,
         matchmaking_service,
+        match_lifecycle_service,
         dev_session_service,
         notification_hub,
         websocket_config: WebSocketConfig::default(),
@@ -123,6 +136,61 @@ async fn create_test_lobby(app: &Router, owner_player_id: Uuid, capacity: Option
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
 
+    response_json(response).await
+}
+
+async fn create_one_vs_one_match(app: &Router, rating: i32) -> (Uuid, Uuid, Uuid, Value) {
+    let first = create_test_player_with_rating(app, "Lifecycle Player One", Some(rating)).await;
+    let second = create_test_player_with_rating(app, "Lifecycle Player Two", Some(rating)).await;
+    for player_id in [first, second] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/matchmaking/enqueue",
+                json!({ "player_id": player_id, "mode": "1v1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/matchmaking/status/{first}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response_json(status).await;
+    let match_id = Uuid::parse_str(status["match_id"].as_str().unwrap()).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/matches/{match_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (first, second, match_id, response_json(response).await)
+}
+
+async fn get_player(app: &Router, player_id: Uuid) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/players/{player_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     response_json(response).await
 }
 
@@ -886,5 +954,222 @@ async fn invalid_matchmaking_mode_is_a_validation_error() {
     assert_eq!(
         response_json(response).await["error"]["code"],
         "invalid_match_mode"
+    );
+}
+
+#[tokio::test]
+async fn match_lifecycle_updates_ratings_once_and_releases_players() {
+    let app = test_app();
+    let (first, second, match_id, created_match) = create_one_vs_one_match(&app, 1200).await;
+    let team_a_player = Uuid::parse_str(
+        created_match["team_a"]["players"][0]["player_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let team_b_player = if team_a_player == first {
+        second
+    } else {
+        first
+    };
+
+    let premature = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/complete"),
+            json!({ "player_id": first, "winning_team": "a" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(premature.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(premature).await["error"]["code"],
+        "invalid_match_transition"
+    );
+
+    let started = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/start"),
+            json!({ "player_id": first }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    assert_eq!(response_json(started).await["status"], "active");
+
+    let completed = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/complete"),
+            json!({ "player_id": second, "winning_team": "a" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let completed = response_json(completed).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["result"]["winning_team"], "a");
+    assert_eq!(
+        completed["result"]["rating_changes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(get_player(&app, team_a_player).await["rating"], 1216);
+    assert_eq!(get_player(&app, team_b_player).await["rating"], 1184);
+
+    for player_id in [first, second] {
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/matchmaking/status/{player_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(status).await["status"], "idle");
+    }
+
+    let repeated = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/complete"),
+            json!({ "player_id": first, "winning_team": "a" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), StatusCode::OK);
+    assert_eq!(get_player(&app, team_a_player).await["rating"], 1216);
+    assert_eq!(get_player(&app, team_b_player).await["rating"], 1184);
+
+    let conflict = app
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/complete"),
+            json!({ "player_id": first, "winning_team": "b" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(conflict).await["error"]["code"],
+        "match_result_conflict"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_match_completion_applies_rating_change_once() {
+    let app = test_app();
+    let (first, second, match_id, created_match) = create_one_vs_one_match(&app, 1200).await;
+    let team_a_player = Uuid::parse_str(
+        created_match["team_a"]["players"][0]["player_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let team_b_player = if team_a_player == first {
+        second
+    } else {
+        first
+    };
+    let started = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/start"),
+            json!({ "player_id": first }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+
+    let mut completions = JoinSet::new();
+    for requested_by in [first, second] {
+        let app = app.clone();
+        completions.spawn(async move {
+            app.oneshot(json_request(
+                "POST",
+                &format!("/api/v1/matches/{match_id}/complete"),
+                json!({ "player_id": requested_by, "winning_team": "a" }),
+            ))
+            .await
+            .unwrap()
+        });
+    }
+    while let Some(response) = completions.join_next().await {
+        assert_eq!(response.unwrap().status(), StatusCode::OK);
+    }
+
+    assert_eq!(get_player(&app, team_a_player).await["rating"], 1216);
+    assert_eq!(get_player(&app, team_b_player).await["rating"], 1184);
+}
+
+#[tokio::test]
+async fn cancellation_is_idempotent_and_non_participants_are_forbidden() {
+    let app = test_app();
+    let (first, second, match_id, _) = create_one_vs_one_match(&app, 1200).await;
+    let outsider = create_test_player(&app, "Lifecycle Outsider").await;
+
+    let forbidden = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/start"),
+            json!({ "player_id": outsider }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(forbidden).await["error"]["code"],
+        "player_not_in_match"
+    );
+
+    for _ in 0..2 {
+        let cancelled = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/matches/{match_id}/cancel"),
+                json!({ "player_id": first }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        assert_eq!(response_json(cancelled).await["status"], "cancelled");
+    }
+
+    let requeued = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/matchmaking/enqueue",
+            json!({ "player_id": second, "mode": "1v1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(requeued.status(), StatusCode::OK);
+    assert_eq!(response_json(requeued).await["status"], "queued");
+
+    let invalid_team = app
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/v1/matches/{match_id}/complete"),
+            json!({ "player_id": first, "winning_team": "draw" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_team.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(invalid_team).await["error"]["code"],
+        "invalid_winning_team"
     );
 }

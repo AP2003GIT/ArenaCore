@@ -18,7 +18,7 @@ use crate::{
 };
 
 pub struct InMemoryMatchmakingRepository {
-    state: RwLock<MatchmakingState>,
+    pub(crate) state: RwLock<MatchmakingState>,
     activity_registry: Arc<PlayerActivityRegistry>,
 }
 

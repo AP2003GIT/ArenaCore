@@ -40,6 +40,7 @@ pub struct GameMatchResponse {
     status: &'static str,
     team_a: TeamResponse,
     team_b: TeamResponse,
+    result: Option<MatchResultResponse>,
 }
 
 #[derive(Serialize)]
@@ -52,6 +53,20 @@ pub struct TeamResponse {
 pub struct MatchPlayerResponse {
     player_id: Uuid,
     rating: u16,
+}
+
+#[derive(Serialize)]
+pub struct MatchResultResponse {
+    winning_team: &'static str,
+    rating_changes: Vec<RatingChangeResponse>,
+}
+
+#[derive(Serialize)]
+pub struct RatingChangeResponse {
+    player_id: Uuid,
+    rating_before: u16,
+    rating_after: u16,
+    delta: i16,
 }
 
 pub async fn enqueue(
@@ -159,6 +174,19 @@ impl From<GameMatch> for GameMatchResponse {
             status: game_match.status().as_str(),
             team_a: TeamResponse::new(game_match.team_a()),
             team_b: TeamResponse::new(game_match.team_b()),
+            result: game_match.result().map(|result| MatchResultResponse {
+                winning_team: result.winning_team().as_str(),
+                rating_changes: result
+                    .rating_changes()
+                    .iter()
+                    .map(|change| RatingChangeResponse {
+                        player_id: change.player_id(),
+                        rating_before: change.rating_before(),
+                        rating_after: change.rating_after(),
+                        delta: change.delta(),
+                    })
+                    .collect(),
+            }),
         }
     }
 }

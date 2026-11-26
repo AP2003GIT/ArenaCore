@@ -20,7 +20,9 @@ Production clients should use HTTPS and WSS. They should treat new JSON fields a
 3. Open the player's authenticated WebSocket connection.
 4. Join a lobby or enter matchmaking, but never both at once.
 5. When `match_found` arrives, read `GET /api/v1/matches/{match_id}`.
-6. Preserve the returned teams and rating snapshot for the match screen.
+6. Preserve the returned teams and assignment-time rating snapshot for the match screen.
+7. Start the match, then complete it with a winning team or cancel it.
+8. Refresh the match and player resources after the terminal lifecycle event.
 
 The development session endpoint is scaffolding. A production identity provider should replace it with short-lived signed credentials without changing the player-bound authorization rule.
 
@@ -91,7 +93,7 @@ When status is `matched`, `match_id` is present:
 }
 ```
 
-The match resource is an immutable assignment snapshot in the current milestone:
+The match resource preserves its assignment snapshot while its status and optional result advance through the lifecycle:
 
 ```json
 {
@@ -105,9 +107,45 @@ The match resource is an immutable assignment snapshot in the current milestone:
   "team_b": {
     "total_rating": 1220,
     "players": [{"player_id":"744fef70-31f4-447d-a5a9-ce7a82e97093","rating":1220}]
+  },
+  "result": null
+}
+```
+
+## Match lifecycle operations
+
+| Action | Method and path | Request body |
+| --- | --- | --- |
+| Start | `POST /api/v1/matches/{match_id}/start` | `{"player_id":"uuid"}` |
+| Complete | `POST /api/v1/matches/{match_id}/complete` | `{"player_id":"uuid","winning_team":"a"}` |
+| Cancel | `POST /api/v1/matches/{match_id}/cancel` | `{"player_id":"uuid"}` |
+
+Only a player assigned to the match may issue these development commands. A match starts as `ready`, becomes `active`, and can then become `completed`; either `ready` or `active` may instead become `cancelled`. A successful completion includes the winner and auditable Elo changes:
+
+```json
+{
+  "id": "7632f584-2864-49d5-9552-6609db96c16a",
+  "mode": "1v1",
+  "status": "completed",
+  "team_a": {
+    "total_rating": 1200,
+    "players": [{"player_id":"ff3db0fd-65f1-4a8e-b5da-10f6fa109882","rating":1200}]
+  },
+  "team_b": {
+    "total_rating": 1200,
+    "players": [{"player_id":"744fef70-31f4-447d-a5a9-ce7a82e97093","rating":1200}]
+  },
+  "result": {
+    "winning_team": "a",
+    "rating_changes": [
+      {"player_id":"ff3db0fd-65f1-4a8e-b5da-10f6fa109882","rating_before":1200,"rating_after":1216,"delta":16},
+      {"player_id":"744fef70-31f4-447d-a5a9-ce7a82e97093","rating_before":1200,"rating_after":1184,"delta":-16}
+    ]
   }
 }
 ```
+
+Repeating start, cancellation, or the same completion is safe. A completion with a conflicting winner returns `409 Conflict`. Terminal transitions release every participant from the match activity. Production deployments should authorize these commands with signed game-server or administrator credentials rather than participant identity alone.
 
 ## WebSocket behavior
 
@@ -122,7 +160,7 @@ Events use this envelope:
 }
 ```
 
-Current event types are `lobby_updated`, `queue_updated`, and `match_found`. Clients must answer protocol ping frames with pong frames. After a disconnect they should reconnect with bounded exponential backoff, then fetch lobby and matchmaking state over HTTP. Event delivery is ephemeral and is not a durable replay log.
+Current event types are `lobby_updated`, `queue_updated`, `match_found`, `match_started`, `match_completed`, and `match_cancelled`. Lifecycle payloads include the match status and teams, plus the winner and rating changes when completed. Clients must answer protocol ping frames with pong frames. After a disconnect they should reconnect with bounded exponential backoff, then fetch lobby, matchmaking, match, and player state over HTTP. Event delivery is ephemeral and is not a durable replay log.
 
 ## Errors and retry policy
 
@@ -155,4 +193,4 @@ Reference HTTP snippets live under `examples/clients`. They demonstrate payload 
 
 ## Deferred gameplay protocol
 
-ArenaCore does not yet allocate a dedicated game server or transport gameplay frames. Do not send movement, combat, physics, or anti-cheat data through the lobby WebSocket. A later protocol should be designed only after load results establish connection counts, acceptable match-start latency, deployment topology, and the required authority model.
+ArenaCore does not yet allocate a dedicated game server or transport gameplay frames. Do not send movement, combat, physics, or anti-cheat data through the lobby WebSocket. The current lifecycle endpoints record control-plane state and ratings; they are not a gameplay transport. A later protocol should be designed only after load results establish connection counts, acceptable match-start latency, deployment topology, and the required authority model.

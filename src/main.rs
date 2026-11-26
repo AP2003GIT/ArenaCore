@@ -7,6 +7,7 @@ use arena_core::{
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
+        match_lifecycle_service::MatchLifecycleService,
         matchmaking_service::{MatchmakingService, SystemClock},
         notification_service::NotificationHub,
         player_service::PlayerService,
@@ -14,11 +15,12 @@ use arena_core::{
     storage::{
         activity::PlayerActivityRegistry,
         lobby_memory::InMemoryLobbyRepository,
+        match_lifecycle_memory::InMemoryMatchLifecycleRepository,
         matchmaking_memory::InMemoryMatchmakingRepository,
         memory::InMemoryPlayerRepository,
         postgres::PostgresRepository,
         readiness::{InMemoryReadiness, PostgresReadiness, ReadinessProbe},
-        LobbyRepository, MatchmakingRepository, PlayerRepository,
+        LobbyRepository, MatchLifecycleRepository, MatchmakingRepository, PlayerRepository,
     },
 };
 use tokio::{
@@ -37,10 +39,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let repositories = match config.database_config().backend() {
         StorageBackend::Memory => {
             let activity_registry = Arc::new(PlayerActivityRegistry::new());
+            let players = Arc::new(InMemoryPlayerRepository::new());
+            let matchmaking = Arc::new(InMemoryMatchmakingRepository::new(Arc::clone(
+                &activity_registry,
+            )));
+            let match_lifecycle = Arc::new(InMemoryMatchLifecycleRepository::new(
+                Arc::clone(&players),
+                Arc::clone(&matchmaking),
+                Arc::clone(&activity_registry),
+            ));
             RepositorySet {
-                players: Arc::new(InMemoryPlayerRepository::new()),
+                players,
                 lobbies: Arc::new(InMemoryLobbyRepository::new(Arc::clone(&activity_registry))),
-                matchmaking: Arc::new(InMemoryMatchmakingRepository::new(activity_registry)),
+                matchmaking,
+                match_lifecycle,
                 readiness: Arc::new(InMemoryReadiness),
             }
         }
@@ -60,6 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 players: repository.clone(),
                 lobbies: repository.clone(),
                 matchmaking: repository.clone(),
+                match_lifecycle: repository.clone(),
                 readiness: Arc::new(PostgresReadiness::new(repository.pool().clone())),
             }
         }
@@ -78,6 +91,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.matchmaking_config(),
         Arc::clone(&notification_hub),
     );
+    let match_lifecycle_service = MatchLifecycleService::new(
+        repositories.match_lifecycle,
+        config.rating_config(),
+        Arc::clone(&notification_hub),
+    );
     let dev_session_service = DevSessionService::new(repositories.players);
     let metrics = Arc::new(OperationalMetrics::default());
     let rate_limiter = Arc::new(RateLimiter::new(
@@ -88,6 +106,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         player_service,
         lobby_service,
         matchmaking_service: matchmaking_service.clone(),
+        match_lifecycle_service,
         dev_session_service,
         notification_hub,
         websocket_config: config.websocket_config(),
@@ -115,6 +134,7 @@ struct RepositorySet {
     players: Arc<dyn PlayerRepository>,
     lobbies: Arc<dyn LobbyRepository>,
     matchmaking: Arc<dyn MatchmakingRepository>,
+    match_lifecycle: Arc<dyn MatchLifecycleRepository>,
     readiness: Arc<dyn ReadinessProbe>,
 }
 

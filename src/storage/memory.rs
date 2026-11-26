@@ -10,7 +10,7 @@ use crate::{
 
 #[derive(Default)]
 pub struct InMemoryPlayerRepository {
-    players: RwLock<HashMap<Uuid, Player>>,
+    pub(crate) players: RwLock<HashMap<Uuid, Player>>,
 }
 
 impl InMemoryPlayerRepository {
