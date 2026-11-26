@@ -8,6 +8,7 @@ use arena_core::{
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
+        match_authority::MatchAuthority,
         match_lifecycle_service::MatchLifecycleService,
         matchmaking_service::{MatchmakingService, SystemClock},
         notification_service::NotificationHub,
@@ -92,6 +93,7 @@ fn test_app() -> TestApp {
         lobby_service,
         matchmaking_service,
         match_lifecycle_service,
+        match_authority: MatchAuthority::new(None, None, true).unwrap(),
         dev_session_service,
         notification_hub: Arc::clone(&notifications),
         websocket_config,
@@ -151,6 +153,21 @@ async fn issue_token(app: &Router, player_id: Uuid) -> Uuid {
             .unwrap(),
     )
     .unwrap()
+}
+
+async fn match_command_request(
+    app: &Router,
+    player_id: Uuid,
+    uri: &str,
+    body: Value,
+) -> Request<Body> {
+    let token = issue_token(app, player_id).await;
+    let mut request = json_request("POST", uri, body);
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    request
 }
 
 async fn start_server(app: Router) -> (String, JoinHandle<()>) {
@@ -272,11 +289,15 @@ async fn websocket_delivers_matchmaking_events_and_cleans_up_disconnect() {
     let started = test_app
         .router
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/start"),
-            json!({ "player_id": first_player }),
-        ))
+        .oneshot(
+            match_command_request(
+                &test_app.router,
+                first_player,
+                &format!("/api/v1/matches/{match_id}/start"),
+                json!({ "player_id": first_player }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(started.status(), StatusCode::OK);
@@ -287,11 +308,15 @@ async fn websocket_delivers_matchmaking_events_and_cleans_up_disconnect() {
     let completed = test_app
         .router
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/complete"),
-            json!({ "player_id": second_player, "winning_team": "a" }),
-        ))
+        .oneshot(
+            match_command_request(
+                &test_app.router,
+                second_player,
+                &format!("/api/v1/matches/{match_id}/complete"),
+                json!({ "player_id": second_player, "winning_team": "a" }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);

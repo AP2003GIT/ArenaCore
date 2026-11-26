@@ -11,7 +11,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{
-    game_match::{GameMatch, MatchLifecycleError, MatchTeam},
+    game_match::{GameMatch, MatchActor, MatchLifecycleError, MatchTeam},
     lobby::{Lobby, LobbyError},
     matchmaking::{MatchmakingConfig, MatchmakingStateError, PlayerMatchmakingStatus, QueueEntry},
     player::Player,
@@ -67,19 +67,19 @@ pub trait MatchLifecycleRepository: Send + Sync {
     async fn start_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError>;
     async fn complete_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
         winning_team: MatchTeam,
         rating_config: RatingConfig,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError>;
     async fn cancel_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError>;
 }
 

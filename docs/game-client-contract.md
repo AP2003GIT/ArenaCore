@@ -116,11 +116,13 @@ The match resource preserves its assignment snapshot while its status and option
 
 | Action | Method and path | Request body |
 | --- | --- | --- |
-| Start | `POST /api/v1/matches/{match_id}/start` | `{"player_id":"uuid"}` |
-| Complete | `POST /api/v1/matches/{match_id}/complete` | `{"player_id":"uuid","winning_team":"a"}` |
-| Cancel | `POST /api/v1/matches/{match_id}/cancel` | `{"player_id":"uuid"}` |
+| Start | `POST /api/v1/matches/{match_id}/start` | Development: `{"player_id":"uuid"}`; signed authority: `{}` |
+| Complete | `POST /api/v1/matches/{match_id}/complete` | Development: `{"player_id":"uuid","winning_team":"a"}`; signed authority: `{"winning_team":"a"}` |
+| Cancel | `POST /api/v1/matches/{match_id}/cancel` | Development: `{"player_id":"uuid"}`; signed authority: `{}` |
 
-Only a player assigned to the match may issue these development commands. A match starts as `ready`, becomes `active`, and can then become `completed`; either `ready` or `active` may instead become `cancelled`. A successful completion includes the winner and auditable Elo changes:
+Development participant commands require an `Authorization: Bearer {access_token}` header issued for that same player and are disabled unless `ARENA_MATCH_ALLOW_DEV_PARTICIPANTS=true`. In a deployed environment, send a short-lived signed bearer credential scoped to the match and command. Game servers may start and complete; administrators may also cancel. Signed-authority request bodies omit `player_id`. See the [match authority contract](match-authority.md) for the canonical signed message and key configuration.
+
+A match starts as `ready`, becomes `active`, and can then become `completed`; either `ready` or `active` may instead become `cancelled`. A successful completion includes the winner and auditable Elo changes:
 
 ```json
 {
@@ -145,7 +147,7 @@ Only a player assigned to the match may issue these development commands. A matc
 }
 ```
 
-Repeating start, cancellation, or the same completion is safe. A completion with a conflicting winner returns `409 Conflict`. Terminal transitions release every participant from the match activity. Production deployments should authorize these commands with signed game-server or administrator credentials rather than participant identity alone.
+Repeating start, cancellation, or the same completion is safe. A completion with a conflicting winner returns `409 Conflict`. Terminal transitions release every participant from the match activity.
 
 ## WebSocket behavior
 

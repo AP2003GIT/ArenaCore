@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::domain::matchmaking::{MatchmakingConfig, MatchmakingConfigError};
 use crate::domain::rating::{RatingConfig, RatingConfigError};
+use crate::service::match_authority::{MatchAuthority, MatchAuthorityConfigError};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 3000;
@@ -175,6 +176,7 @@ pub struct Config {
     port: u16,
     matchmaking: MatchmakingConfig,
     rating: RatingConfig,
+    match_authority: MatchAuthority,
     websocket: WebSocketConfig,
     database: DatabaseConfig,
     rate_limit: RateLimitConfig,
@@ -217,6 +219,19 @@ impl Config {
             "ARENA_RATING_K_FACTOR",
             DEFAULT_RATING_K_FACTOR,
         )?)?;
+        let allow_dev_participants = match env::var("ARENA_MATCH_ALLOW_DEV_PARTICIPANTS").as_deref()
+        {
+            Ok("true") => true,
+            Ok("false") | Err(env::VarError::NotPresent) => false,
+            _ => return Err(ConfigError::InvalidDevMatchSetting),
+        };
+        let game_server_key = match_public_key("ARENA_MATCH_GAME_SERVER_PUBLIC_KEY")?;
+        let administrator_key = match_public_key("ARENA_MATCH_ADMIN_PUBLIC_KEY")?;
+        let match_authority = MatchAuthority::new(
+            game_server_key.as_deref(),
+            administrator_key.as_deref(),
+            allow_dev_participants,
+        )?;
         let backend = match env::var("ARENA_STORAGE").as_deref() {
             Ok("memory") | Err(_) => StorageBackend::Memory,
             Ok("postgres") => StorageBackend::Postgres,
@@ -252,6 +267,7 @@ impl Config {
             port,
             matchmaking,
             rating,
+            match_authority,
             websocket,
             database,
             rate_limit,
@@ -276,12 +292,24 @@ impl Config {
         self.rating
     }
 
+    pub fn match_authority(&self) -> &MatchAuthority {
+        &self.match_authority
+    }
+
     pub fn database_config(&self) -> &DatabaseConfig {
         &self.database
     }
 
     pub fn rate_limit_config(&self) -> RateLimitConfig {
         self.rate_limit
+    }
+}
+
+fn match_public_key(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidPublicKeyEncoding(name)),
     }
 }
 
@@ -359,6 +387,12 @@ pub enum ConfigError {
     InvalidOperationalValue { name: &'static str, value: String },
     #[error("{name} must be an integer from 1 to 128: {value}")]
     InvalidRatingValue { name: &'static str, value: String },
+    #[error("ARENA_MATCH_ALLOW_DEV_PARTICIPANTS must be either true or false")]
+    InvalidDevMatchSetting,
+    #[error("{0} must be valid Unicode")]
+    InvalidPublicKeyEncoding(&'static str),
+    #[error(transparent)]
+    MatchAuthority(#[from] MatchAuthorityConfigError),
     #[error(transparent)]
     Matchmaking(#[from] MatchmakingConfigError),
     #[error(transparent)]
@@ -380,6 +414,7 @@ mod tests {
             port: DEFAULT_PORT,
             matchmaking: MatchmakingConfig::default(),
             rating: RatingConfig::default(),
+            match_authority: MatchAuthority::default(),
             websocket: WebSocketConfig::default(),
             database: DatabaseConfig::default(),
             rate_limit: RateLimitConfig::default(),

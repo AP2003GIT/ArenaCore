@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        game_match::{GameMatch, MatchLifecycleError, MatchTeam},
+        game_match::{GameMatch, MatchActor, MatchLifecycleError, MatchTeam},
         rating::RatingConfig,
     },
     storage::{MatchLifecycleRepository, MatchLifecycleRepositoryError, MatchUpdate},
@@ -36,11 +36,11 @@ impl MatchLifecycleService {
     pub async fn start(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<GameMatch, MatchLifecycleServiceError> {
         let update = self
             .repository
-            .start_match(match_id, requested_by)
+            .start_match(match_id, actor)
             .await
             .map_err(map_repository_error)?;
         self.publish_if_changed(&update, PlayerEvent::match_started);
@@ -50,12 +50,12 @@ impl MatchLifecycleService {
     pub async fn complete(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
         winning_team: MatchTeam,
     ) -> Result<GameMatch, MatchLifecycleServiceError> {
         let update = self
             .repository
-            .complete_match(match_id, requested_by, winning_team, self.rating_config)
+            .complete_match(match_id, actor, winning_team, self.rating_config)
             .await
             .map_err(map_repository_error)?;
         self.publish_if_changed(&update, PlayerEvent::match_completed);
@@ -65,11 +65,11 @@ impl MatchLifecycleService {
     pub async fn cancel(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<GameMatch, MatchLifecycleServiceError> {
         let update = self
             .repository
-            .cancel_match(match_id, requested_by)
+            .cancel_match(match_id, actor)
             .await
             .map_err(map_repository_error)?;
         self.publish_if_changed(&update, PlayerEvent::match_cancelled);

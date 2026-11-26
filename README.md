@@ -1,6 +1,6 @@
 # ArenaCore
 
-ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 7 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, an atomic match lifecycle with Elo rating updates, authenticated real-time notifications, PostgreSQL persistence, operational safeguards, a deterministic load harness, and game-engine integration contracts.
+ArenaCore is an authoritative multiplayer backend built as a Rust modular monolith. Milestones 1 through 8 provide a runnable Axum service, development players, concurrency-safe lobbies, deterministic 1v1 and 2v2 skill matchmaking, an atomic match lifecycle with Elo rating updates, scoped signed match authority, authenticated real-time notifications, PostgreSQL persistence, operational safeguards, a deterministic load harness, and game-engine integration contracts.
 
 ## Prerequisites
 
@@ -35,6 +35,9 @@ Configuration uses environment variables:
 | `ARENA_MATCH_GAP_GROWTH_PER_SECOND` | `10` | Rating points added to the window per second waited |
 | `ARENA_MATCH_MAX_GAP` | `1000` | Maximum allowed rating difference |
 | `ARENA_RATING_K_FACTOR` | `32` | Elo rating sensitivity; must be from 1 through 128 |
+| `ARENA_MATCH_ALLOW_DEV_PARTICIPANTS` | `false` | Allow participant match commands with a development session token |
+| `ARENA_MATCH_GAME_SERVER_PUBLIC_KEY` | unset | Optional raw Ed25519 public key, unpadded base64url, for game-server commands |
+| `ARENA_MATCH_ADMIN_PUBLIC_KEY` | unset | Optional raw Ed25519 public key, unpadded base64url, for administrator commands |
 | `ARENA_WS_CHANNEL_CAPACITY` | `32` | Maximum pending events per WebSocket connection |
 | `ARENA_WS_HEARTBEAT_SECONDS` | `15` | Interval between server ping frames |
 | `ARENA_WS_CLIENT_TIMEOUT_SECONDS` | `45` | Maximum time without client traffic before disconnect |
@@ -154,10 +157,19 @@ When status becomes `matched`, read the match and its assignment-time rating sna
 curl http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000
 ```
 
-Start the match as one of its participants:
+For local participant-driven lifecycle testing, set `ARENA_MATCH_ALLOW_DEV_PARTICIPANTS=true` before starting the server and issue a development session token for one of the match participants:
+
+```bash
+MATCH_TOKEN=$(curl -s -X POST http://127.0.0.1:3000/api/v1/dev/sessions \
+  -H "Content-Type: application/json" \
+  -d '{"player_id":"00000000-0000-0000-0000-000000000000"}' | jq -r '.access_token')
+```
+
+Start the match with that participant's token:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000/start \
+  -H "Authorization: Bearer $MATCH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"player_id":"00000000-0000-0000-0000-000000000000"}'
 ```
@@ -166,11 +178,14 @@ Complete an active match and award Elo changes atomically. `winning_team` is `a`
 
 ```bash
 curl -X POST http://127.0.0.1:3000/api/v1/matches/00000000-0000-0000-0000-000000000000/complete \
+  -H "Authorization: Bearer $MATCH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"player_id":"00000000-0000-0000-0000-000000000000","winning_team":"a"}'
 ```
 
-To abandon a `ready` or `active` match without changing ratings, post the participant's `player_id` to `/api/v1/matches/{match_id}/cancel`. Start, same-result completion, and cancellation commands are idempotent. Completing with a different winner after a result exists returns `409 Conflict`.
+To abandon a `ready` or `active` match without changing ratings, post the participant's `player_id` to `/api/v1/matches/{match_id}/cancel` with the same bearer header. Start, same-result completion, and cancellation commands are idempotent. Completing with a different winner after a result exists returns `409 Conflict`.
+
+Participant commands are disabled by default. In production, configure an Ed25519 public key for the game server and optionally a different key for administrators; send a short-lived, command-scoped signed bearer token and omit `player_id` from the request. Game servers can start and complete matches. Administrators can start, complete, or cancel them. See the [match authority contract](docs/match-authority.md) for credential construction and key handling.
 
 Each player can have only one active activity: lobby membership, queue membership, or a match assignment. Duplicate queue requests and conflicting lobby operations return `409 Conflict` with machine-readable codes.
 
@@ -180,7 +195,7 @@ The 1v1 and 2v2 queues are independent. The matcher considers players in enqueue
 
 For 2v2, the matcher first selects four mutually compatible players with the smallest rating spread. It then enumerates the three unique two-team partitions and minimizes the absolute difference between team rating totals. UUID ordering provides deterministic tie-breaks. A one-second background tick reevaluates queues so waiting players can match after their rating windows expand even when no new enqueue request arrives.
 
-Matches transition from `ready` to `active`, then to `completed`; a `ready` or `active` match can instead become `cancelled`. Completion uses the team-average Elo expectation and the configured K-factor, persists every player's before/after rating and delta, and releases all participants for their next activity in the same transaction. Cancellation also releases participants but does not alter ratings. During development, any match participant may issue lifecycle commands; production authority should move to signed game-server or administrator credentials.
+Matches transition from `ready` to `active`, then to `completed`; a `ready` or `active` match can instead become `cancelled`. Completion uses the team-average Elo expectation and the configured K-factor, persists every player's before/after rating and delta, and releases all participants for their next activity in the same transaction. Cancellation also releases participants but does not alter ratings. Match history records whether a lifecycle transition was submitted by a development player, game server, or administrator.
 
 ### Real-time notifications
 
@@ -230,14 +245,14 @@ Errors use a stable envelope:
 
 - `api` owns HTTP handlers, request/response DTOs, and transport error mapping.
 - `domain` owns players, lobbies, queues, match lifecycle, Elo calculation, matching policy, and state invariants, independent of Axum.
-- `service` owns validation, player/lobby/matchmaking/lifecycle use cases, development sessions, and notification fan-out.
+- `service` owns validation, player/lobby/matchmaking/lifecycle use cases, scoped match-credential verification, development sessions, and notification fan-out.
 - `storage` defines repository boundaries plus in-memory and SQLx PostgreSQL implementations.
 - `operations` owns request metrics and the bounded per-client rate limiter.
 - `app` wires routes to application state, while `main` handles process concerns such as configuration, tracing, listening, and shutdown.
 
 The in-memory repositories use standard-library `RwLock` values. Their critical sections contain only short state transitions and never cross an `.await`. A shared player-activity registry atomically prevents lobby, queue, and match membership from overlapping.
 
-The PostgreSQL implementation stores players, lobbies, memberships, queue entries, match snapshots, match players, results, per-player rating changes, active-player ownership, and append-only match history. Lobby mutations lock the affected rows and commit membership, owner, status, and activity changes in one transaction. Matchmaking uses one PostgreSQL advisory transaction lock to serialize queue selection across API and background workers; this favors correctness and simple recovery over maximum matching throughput. Match creation, queue removal, player activity updates, and the first history entry commit atomically. Match completion locks the match and player rows, then commits its result, ratings, history, and activity release together so concurrent duplicate submissions cannot apply Elo twice.
+The PostgreSQL implementation stores players, lobbies, memberships, queue entries, match snapshots, match players, results, per-player rating changes, active-player ownership, and append-only match history. Result rows record whether a development player, game server, or administrator submitted the result; lifecycle history records the same authority. Lobby mutations lock the affected rows and commit membership, owner, status, and activity changes in one transaction. Matchmaking uses one PostgreSQL advisory transaction lock to serialize queue selection across API and background workers; this favors correctness and simple recovery over maximum matching throughput. Match creation, queue removal, player activity updates, and the first history entry commit atomically. Match completion locks the match and player rows, then commits its result, ratings, history, and activity release together so concurrent duplicate submissions cannot apply Elo twice.
 
 Memory mode remains the default for fast development and database-free tests. Development bearer sessions and live WebSocket delivery are process-local in both modes.
 

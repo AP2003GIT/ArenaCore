@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         lobby_service,
         matchmaking_service: matchmaking_service.clone(),
         match_lifecycle_service,
+        match_authority: config.match_authority().clone(),
         dev_session_service,
         notification_hub,
         websocket_config: config.websocket_config(),

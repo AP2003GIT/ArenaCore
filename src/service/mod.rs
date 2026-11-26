@@ -1,5 +1,6 @@
 pub mod dev_session_service;
 pub mod lobby_service;
+pub mod match_authority;
 pub mod match_lifecycle_service;
 pub mod matchmaking_service;
 pub mod notification_service;

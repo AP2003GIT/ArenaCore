@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        game_match::{GameMatch, MatchTeam},
+        game_match::{GameMatch, MatchActor, MatchTeam},
         rating::{calculate_match_result, RatingConfig},
     },
     storage::{
@@ -75,7 +75,7 @@ impl MatchLifecycleRepository for InMemoryMatchLifecycleRepository {
     async fn start_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
         let mut state = self
             .matchmaking
@@ -85,7 +85,7 @@ impl MatchLifecycleRepository for InMemoryMatchLifecycleRepository {
         let mut game_match = state
             .find_match(match_id)
             .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
-        let changed = game_match.start(requested_by)?;
+        let changed = game_match.start(actor)?;
         state.replace_match(game_match.clone());
         Ok(MatchUpdate {
             game_match,
@@ -96,7 +96,7 @@ impl MatchLifecycleRepository for InMemoryMatchLifecycleRepository {
     async fn complete_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
         winning_team: MatchTeam,
         rating_config: RatingConfig,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
@@ -114,7 +114,7 @@ impl MatchLifecycleRepository for InMemoryMatchLifecycleRepository {
             .find_match(match_id)
             .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
         let result = calculate_match_result(&game_match, winning_team, rating_config);
-        let changed = game_match.complete(requested_by, result)?;
+        let changed = game_match.complete(actor, result)?;
         if !changed {
             return Ok(MatchUpdate {
                 game_match,
@@ -156,7 +156,7 @@ impl MatchLifecycleRepository for InMemoryMatchLifecycleRepository {
     async fn cancel_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
         let mut activities = self
             .activities
@@ -171,7 +171,7 @@ impl MatchLifecycleRepository for InMemoryMatchLifecycleRepository {
         let mut game_match = state
             .find_match(match_id)
             .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
-        let changed = game_match.cancel(requested_by)?;
+        let changed = game_match.cancel(actor)?;
         if changed {
             self.release_terminal_match(game_match.clone(), &mut activities, &mut state)?;
         }

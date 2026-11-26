@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::{
     domain::{
         game_match::{
-            GameMatch, MatchMode, MatchPlayer, MatchResult, MatchStatus, MatchTeam, RatingChange,
+            GameMatch, MatchActor, MatchMode, MatchPlayer, MatchResult, MatchStatus, MatchTeam,
+            RatingChange,
         },
         lobby::{Lobby, LobbyError, LobbyMember, LobbyStatus},
         matchmaking::{MatchmakingConfig, MatchmakingState, PlayerMatchmakingStatus, QueueEntry},
@@ -636,7 +637,7 @@ impl MatchLifecycleRepository for PostgresRepository {
     async fn start_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
         let mut transaction = self
             .pool
@@ -648,7 +649,7 @@ impl MatchLifecycleRepository for PostgresRepository {
             .map_err(map_match_read_error)?
             .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
         let previous_status = game_match.status();
-        let changed = game_match.start(requested_by)?;
+        let changed = game_match.start(actor)?;
         if changed {
             sqlx::query(
                 "UPDATE matches SET status = $2, started_at = COALESCE(started_at, NOW()), updated_at = NOW() WHERE id = $1",
@@ -663,7 +664,7 @@ impl MatchLifecycleRepository for PostgresRepository {
                 match_id,
                 previous_status,
                 game_match.status(),
-                serde_json::json!({ "requested_by_player_id": requested_by }),
+                match_actor_metadata(actor),
             )
             .await?;
         }
@@ -680,7 +681,7 @@ impl MatchLifecycleRepository for PostgresRepository {
     async fn complete_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
         winning_team: MatchTeam,
         rating_config: RatingConfig,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
@@ -695,7 +696,7 @@ impl MatchLifecycleRepository for PostgresRepository {
             .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
         let previous_status = game_match.status();
         let result = calculate_match_result(&game_match, winning_team, rating_config);
-        let changed = game_match.complete(requested_by, result)?;
+        let changed = game_match.complete(actor, result)?;
         if !changed {
             transaction
                 .commit()
@@ -730,11 +731,12 @@ impl MatchLifecycleRepository for PostgresRepository {
                 .map_err(MatchLifecycleRepositoryError::Database)?;
         }
         sqlx::query(
-            "INSERT INTO match_results (match_id, winning_team, submitted_by_player_id) VALUES ($1, $2, $3)",
+            "INSERT INTO match_results (match_id, winning_team, submitted_by_player_id, submitted_by_authority) VALUES ($1, $2, $3, $4)",
         )
         .bind(match_id)
         .bind(winning_team.number())
-        .bind(requested_by)
+        .bind(actor.player_id())
+        .bind(actor.authority())
         .execute(&mut *transaction)
         .await
         .map_err(MatchLifecycleRepositoryError::Database)?;
@@ -760,15 +762,14 @@ impl MatchLifecycleRepository for PostgresRepository {
         .await
         .map_err(MatchLifecycleRepositoryError::Database)?;
         release_match_activities(&mut transaction, &game_match).await?;
+        let mut metadata = match_actor_metadata(actor);
+        metadata["winning_team"] = serde_json::json!(winning_team.as_str());
         append_match_history(
             &mut transaction,
             match_id,
             previous_status,
             game_match.status(),
-            serde_json::json!({
-                "requested_by_player_id": requested_by,
-                "winning_team": winning_team.as_str(),
-            }),
+            metadata,
         )
         .await?;
         transaction
@@ -785,7 +786,7 @@ impl MatchLifecycleRepository for PostgresRepository {
     async fn cancel_match(
         &self,
         match_id: Uuid,
-        requested_by: Uuid,
+        actor: MatchActor,
     ) -> Result<MatchUpdate, MatchLifecycleRepositoryError> {
         let mut transaction = self
             .pool
@@ -797,7 +798,7 @@ impl MatchLifecycleRepository for PostgresRepository {
             .map_err(map_match_read_error)?
             .ok_or(MatchLifecycleRepositoryError::MatchNotFound)?;
         let previous_status = game_match.status();
-        let changed = game_match.cancel(requested_by)?;
+        let changed = game_match.cancel(actor)?;
         if changed {
             sqlx::query(
                 "UPDATE matches SET status = $2, finished_at = NOW(), updated_at = NOW() WHERE id = $1",
@@ -813,7 +814,7 @@ impl MatchLifecycleRepository for PostgresRepository {
                 match_id,
                 previous_status,
                 game_match.status(),
-                serde_json::json!({ "requested_by_player_id": requested_by }),
+                match_actor_metadata(actor),
             )
             .await?;
         }
@@ -827,6 +828,14 @@ impl MatchLifecycleRepository for PostgresRepository {
             changed,
         })
     }
+}
+
+fn match_actor_metadata(actor: MatchActor) -> serde_json::Value {
+    let mut metadata = serde_json::json!({ "authority": actor.authority() });
+    if let Some(player_id) = actor.player_id() {
+        metadata["requested_by_player_id"] = serde_json::json!(player_id);
+    }
+    metadata
 }
 
 async fn release_match_activities(

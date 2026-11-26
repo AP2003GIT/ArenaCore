@@ -1,6 +1,30 @@
 use thiserror::Error;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MatchActor {
+    DevelopmentPlayer(Uuid),
+    GameServer,
+    Administrator,
+}
+
+impl MatchActor {
+    pub fn authority(self) -> &'static str {
+        match self {
+            Self::DevelopmentPlayer(_) => "development_player",
+            Self::GameServer => "game_server",
+            Self::Administrator => "administrator",
+        }
+    }
+
+    pub fn player_id(self) -> Option<Uuid> {
+        match self {
+            Self::DevelopmentPlayer(player_id) => Some(player_id),
+            Self::GameServer | Self::Administrator => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MatchMode {
     OneVsOne,
@@ -251,8 +275,8 @@ impl GameMatch {
         total_rating(&self.team_b)
     }
 
-    pub fn start(&mut self, requested_by: Uuid) -> Result<bool, MatchLifecycleError> {
-        self.ensure_participant(requested_by)?;
+    pub fn start(&mut self, actor: MatchActor) -> Result<bool, MatchLifecycleError> {
+        self.check_actor(actor)?;
         match self.status {
             MatchStatus::Ready => {
                 self.status = MatchStatus::Active;
@@ -267,10 +291,10 @@ impl GameMatch {
 
     pub fn complete(
         &mut self,
-        requested_by: Uuid,
+        actor: MatchActor,
         result: MatchResult,
     ) -> Result<bool, MatchLifecycleError> {
-        self.ensure_participant(requested_by)?;
+        self.check_actor(actor)?;
         match self.status {
             MatchStatus::Active => {
                 self.status = MatchStatus::Completed;
@@ -292,8 +316,8 @@ impl GameMatch {
         }
     }
 
-    pub fn cancel(&mut self, requested_by: Uuid) -> Result<bool, MatchLifecycleError> {
-        self.ensure_participant(requested_by)?;
+    pub fn cancel(&mut self, actor: MatchActor) -> Result<bool, MatchLifecycleError> {
+        self.check_actor(actor)?;
         match self.status {
             MatchStatus::Ready | MatchStatus::Active => {
                 self.status = MatchStatus::Cancelled;
@@ -304,11 +328,14 @@ impl GameMatch {
         }
     }
 
-    fn ensure_participant(&self, player_id: Uuid) -> Result<(), MatchLifecycleError> {
-        if self.contains_player(player_id) {
-            Ok(())
-        } else {
+    fn check_actor(&self, actor: MatchActor) -> Result<(), MatchLifecycleError> {
+        if actor
+            .player_id()
+            .is_some_and(|id| !self.contains_player(id))
+        {
             Err(MatchLifecycleError::PlayerNotParticipant)
+        } else {
+            Ok(())
         }
     }
 }
@@ -348,6 +375,8 @@ mod tests {
     #[test]
     fn lifecycle_is_idempotent_but_rejects_conflicting_result() {
         let (mut game_match, first, second) = game_match();
+        let first = MatchActor::DevelopmentPlayer(first);
+        let second = MatchActor::DevelopmentPlayer(second);
         assert!(game_match.start(first).unwrap());
         assert!(!game_match.start(second).unwrap());
 
@@ -366,7 +395,7 @@ mod tests {
         let (mut game_match, _, _) = game_match();
 
         assert!(matches!(
-            game_match.start(Uuid::new_v4()),
+            game_match.start(MatchActor::DevelopmentPlayer(Uuid::new_v4())),
             Err(MatchLifecycleError::PlayerNotParticipant)
         ));
     }

@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use arena_core::{
     domain::{
-        game_match::{MatchMode, MatchStatus, MatchTeam},
+        game_match::{MatchActor, MatchMode, MatchStatus, MatchTeam},
         lobby::{Lobby, LobbyStatus},
         matchmaking::{MatchmakingConfig, PlayerMatchmakingStatus, QueueEntry},
         player::Player,
@@ -127,16 +127,19 @@ async fn postgres_repositories_preserve_invariants_and_history() {
         .unwrap()
         .unwrap();
     assert_eq!(stored_match, *formed_match);
-    let started =
-        MatchLifecycleRepository::start_match(&*repository, formed_match.id(), first.id())
-            .await
-            .unwrap();
+    let started = MatchLifecycleRepository::start_match(
+        &*repository,
+        formed_match.id(),
+        MatchActor::DevelopmentPlayer(first.id()),
+    )
+    .await
+    .unwrap();
     assert!(started.changed);
     assert_eq!(started.game_match.status(), MatchStatus::Active);
     let completed = MatchLifecycleRepository::complete_match(
         &*repository,
         formed_match.id(),
-        second.id(),
+        MatchActor::DevelopmentPlayer(second.id()),
         MatchTeam::A,
         RatingConfig::default(),
     )
@@ -147,7 +150,7 @@ async fn postgres_repositories_preserve_invariants_and_history() {
     let repeated = MatchLifecycleRepository::complete_match(
         &*repository,
         formed_match.id(),
-        first.id(),
+        MatchActor::DevelopmentPlayer(first.id()),
         MatchTeam::A,
         RatingConfig::default(),
     )

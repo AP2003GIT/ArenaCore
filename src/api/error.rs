@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::service::{
     dev_session_service::DevSessionError, lobby_service::LobbyServiceError,
-    match_lifecycle_service::MatchLifecycleServiceError,
+    match_authority::MatchAuthorizationError, match_lifecycle_service::MatchLifecycleServiceError,
     matchmaking_service::MatchmakingServiceError, player_service::PlayerServiceError,
 };
 
@@ -80,6 +80,23 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "route_not_found",
             message: "the requested route does not exist",
+        }
+    }
+}
+
+impl From<MatchAuthorizationError> for ApiError {
+    fn from(error: MatchAuthorizationError) -> Self {
+        match error {
+            MatchAuthorizationError::InvalidCredential => Self {
+                status: StatusCode::UNAUTHORIZED,
+                code: "invalid_match_credential",
+                message: "a valid bearer credential for this match command is required",
+            },
+            MatchAuthorizationError::Forbidden => Self {
+                status: StatusCode::FORBIDDEN,
+                code: "match_command_forbidden",
+                message: "the credential role cannot perform this match command",
+            },
         }
     }
 }

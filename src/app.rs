@@ -12,8 +12,9 @@ use crate::{
     operations::{enforce_rate_limit, observe_requests, OperationalMetrics, RateLimiter},
     service::{
         dev_session_service::DevSessionService, lobby_service::LobbyService,
-        match_lifecycle_service::MatchLifecycleService, matchmaking_service::MatchmakingService,
-        notification_service::NotificationHub, player_service::PlayerService,
+        match_authority::MatchAuthority, match_lifecycle_service::MatchLifecycleService,
+        matchmaking_service::MatchmakingService, notification_service::NotificationHub,
+        player_service::PlayerService,
     },
     storage::readiness::ReadinessProbe,
 };
@@ -24,6 +25,7 @@ pub struct AppState {
     pub lobby_service: LobbyService,
     pub matchmaking_service: MatchmakingService,
     pub match_lifecycle_service: MatchLifecycleService,
+    pub match_authority: MatchAuthority,
     pub dev_session_service: DevSessionService,
     pub notification_hub: Arc<NotificationHub>,
     pub websocket_config: WebSocketConfig,

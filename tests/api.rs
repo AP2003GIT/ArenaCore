@@ -8,6 +8,7 @@ use arena_core::{
     service::{
         dev_session_service::DevSessionService,
         lobby_service::LobbyService,
+        match_authority::MatchAuthority,
         match_lifecycle_service::MatchLifecycleService,
         matchmaking_service::{MatchmakingService, SystemClock},
         notification_service::NotificationHub,
@@ -74,6 +75,7 @@ fn test_app_with_rate_limit(rate_limit_config: RateLimitConfig) -> Router {
         lobby_service,
         matchmaking_service,
         match_lifecycle_service,
+        match_authority: MatchAuthority::new(None, None, true).unwrap(),
         dev_session_service,
         notification_hub,
         websocket_config: WebSocketConfig::default(),
@@ -90,6 +92,34 @@ fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
+}
+
+async fn match_command_request(
+    app: &Router,
+    player_id: Uuid,
+    uri: &str,
+    body: Value,
+) -> Request<Body> {
+    let session = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/v1/dev/sessions",
+            json!({ "player_id": player_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::CREATED);
+    let token = response_json(session).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut request = json_request("POST", uri, body);
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    request
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -975,11 +1005,15 @@ async fn match_lifecycle_updates_ratings_once_and_releases_players() {
 
     let premature = app
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/complete"),
-            json!({ "player_id": first, "winning_team": "a" }),
-        ))
+        .oneshot(
+            match_command_request(
+                &app,
+                first,
+                &format!("/api/v1/matches/{match_id}/complete"),
+                json!({ "player_id": first, "winning_team": "a" }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(premature.status(), StatusCode::CONFLICT);
@@ -990,11 +1024,15 @@ async fn match_lifecycle_updates_ratings_once_and_releases_players() {
 
     let started = app
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/start"),
-            json!({ "player_id": first }),
-        ))
+        .oneshot(
+            match_command_request(
+                &app,
+                first,
+                &format!("/api/v1/matches/{match_id}/start"),
+                json!({ "player_id": first }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(started.status(), StatusCode::OK);
@@ -1002,11 +1040,15 @@ async fn match_lifecycle_updates_ratings_once_and_releases_players() {
 
     let completed = app
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/complete"),
-            json!({ "player_id": second, "winning_team": "a" }),
-        ))
+        .oneshot(
+            match_command_request(
+                &app,
+                second,
+                &format!("/api/v1/matches/{match_id}/complete"),
+                json!({ "player_id": second, "winning_team": "a" }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(completed.status(), StatusCode::OK);
@@ -1039,11 +1081,15 @@ async fn match_lifecycle_updates_ratings_once_and_releases_players() {
 
     let repeated = app
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/complete"),
-            json!({ "player_id": first, "winning_team": "a" }),
-        ))
+        .oneshot(
+            match_command_request(
+                &app,
+                first,
+                &format!("/api/v1/matches/{match_id}/complete"),
+                json!({ "player_id": first, "winning_team": "a" }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(repeated.status(), StatusCode::OK);
@@ -1051,11 +1097,16 @@ async fn match_lifecycle_updates_ratings_once_and_releases_players() {
     assert_eq!(get_player(&app, team_b_player).await["rating"], 1184);
 
     let conflict = app
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/complete"),
-            json!({ "player_id": first, "winning_team": "b" }),
-        ))
+        .clone()
+        .oneshot(
+            match_command_request(
+                &app,
+                first,
+                &format!("/api/v1/matches/{match_id}/complete"),
+                json!({ "player_id": first, "winning_team": "b" }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
@@ -1082,11 +1133,15 @@ async fn concurrent_match_completion_applies_rating_change_once() {
     };
     let started = app
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/start"),
-            json!({ "player_id": first }),
-        ))
+        .oneshot(
+            match_command_request(
+                &app,
+                first,
+                &format!("/api/v1/matches/{match_id}/start"),
+                json!({ "player_id": first }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(started.status(), StatusCode::OK);
@@ -1095,13 +1150,14 @@ async fn concurrent_match_completion_applies_rating_change_once() {
     for requested_by in [first, second] {
         let app = app.clone();
         completions.spawn(async move {
-            app.oneshot(json_request(
-                "POST",
+            let request = match_command_request(
+                &app,
+                requested_by,
                 &format!("/api/v1/matches/{match_id}/complete"),
                 json!({ "player_id": requested_by, "winning_team": "a" }),
-            ))
-            .await
-            .unwrap()
+            )
+            .await;
+            app.oneshot(request).await.unwrap()
         });
     }
     while let Some(response) = completions.join_next().await {
@@ -1120,11 +1176,15 @@ async fn cancellation_is_idempotent_and_non_participants_are_forbidden() {
 
     let forbidden = app
         .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/start"),
-            json!({ "player_id": outsider }),
-        ))
+        .oneshot(
+            match_command_request(
+                &app,
+                outsider,
+                &format!("/api/v1/matches/{match_id}/start"),
+                json!({ "player_id": outsider }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
@@ -1136,11 +1196,15 @@ async fn cancellation_is_idempotent_and_non_participants_are_forbidden() {
     for _ in 0..2 {
         let cancelled = app
             .clone()
-            .oneshot(json_request(
-                "POST",
-                &format!("/api/v1/matches/{match_id}/cancel"),
-                json!({ "player_id": first }),
-            ))
+            .oneshot(
+                match_command_request(
+                    &app,
+                    first,
+                    &format!("/api/v1/matches/{match_id}/cancel"),
+                    json!({ "player_id": first }),
+                )
+                .await,
+            )
             .await
             .unwrap();
         assert_eq!(cancelled.status(), StatusCode::OK);
@@ -1160,11 +1224,16 @@ async fn cancellation_is_idempotent_and_non_participants_are_forbidden() {
     assert_eq!(response_json(requeued).await["status"], "queued");
 
     let invalid_team = app
-        .oneshot(json_request(
-            "POST",
-            &format!("/api/v1/matches/{match_id}/complete"),
-            json!({ "player_id": first, "winning_team": "draw" }),
-        ))
+        .clone()
+        .oneshot(
+            match_command_request(
+                &app,
+                first,
+                &format!("/api/v1/matches/{match_id}/complete"),
+                json!({ "player_id": first, "winning_team": "draw" }),
+            )
+            .await,
+        )
         .await
         .unwrap();
     assert_eq!(invalid_team.status(), StatusCode::UNPROCESSABLE_ENTITY);
